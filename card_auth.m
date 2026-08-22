@@ -124,13 +124,13 @@ static bool kc_set_string(NSString *key, NSString *value) {
         (__bridge id)kSecAttrAccount: key
     };
     NSDictionary *attrs = @{
-        (__bridge id)kSecValue: data
+        (__bridge id)kSecValueData: data
     };
     OSStatus status = SecItemUpdate((__bridge CFDictionaryRef)query,
                                      (__bridge CFDictionaryRef)attrs);
     if (status == errSecItemNotFound) {
         NSMutableDictionary *add = [query mutableCopy];
-        [add setObject:data forKey:(__bridge id)kSecValue];
+        [add setObject:data forKey:(__bridge id)kSecValueData];
         status = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
     }
     return (status == errSecSuccess);
@@ -537,7 +537,7 @@ static CardAuthWindow *g_auth_window = nil;
             [self showErrorAlert:@"解密失败" message:@"绑定卡密载荷格式错误"];
             return false;
         }
-        expire_ts = segs[0].longLongValue;
+        expire_ts = [segs[0] longLongValue];
         NSString *bind_device_id = segs[1];
         /* 与本机对比 */
         NSString *local_id = get_local_device_id();
@@ -652,7 +652,7 @@ static void check_authorization(void) {
 
     /* 明文可能是 G(纯时间戳) 或 B(时间戳||设备ID), 取第一段 */
     NSArray *segs = [plain_str componentsSeparatedByString:@"||"];
-    int64_t expire_ts = segs[0].longLongValue;
+    int64_t expire_ts = [segs[0] longLongValue];
 
     /* 3. 获取当前系统时间、当前 boottime */
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
