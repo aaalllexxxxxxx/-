@@ -945,7 +945,10 @@ static void install_sendEvent_hook(void) {
  * ========================================================= */
 
 /* 运行期检查间隔 (秒). 越短越及时, 越省电越闲就越大. */
-#define WATCHDOG_INTERVAL_SEC 5
+#define WATCHDOG_INTERVAL_SEC 3
+
+/* 启动期栅栏的最大等待毫秒数 (10s). 超过就放弃本轮, 下一 tick 继续. */
+#define WATCHDOG_INIT_WAIT_MS 10000
 
 /* 到期后给用户看提示的缓冲时长 (秒), 随后再 exit(0).
  * 设 0 表示到期立刻杀进程.
@@ -965,48 +968,65 @@ static int64_t watchdog_remaining_seconds(void) {
     return exp - now;
 }
 
-static void watchdog_kill(void) {
-    /* 关键顺序: 自杀前必须先把 Keychain 中「会让 check_authorization 误判的记录」清空.
-     *   - 如果不清 KC_ACTIVE_EXPIRE_TS: 下次启动, watchdog 的第一次 tick 会在
-     *     check_authorization 跑到 fatal 路径之前就再次看到过期的时间戳 -> 再次 exit(0)
-     *     -> 无限循环 "双击闪退", 激活窗永远显示不出来.
-     *   - 同步清 ACTIVE_CARD / TIME_CHECK_REC: 下次启动直接走干净的 show_auth_window_on_main
-     *     (无 KC = 新用户状态), 用户可以立刻输入新激活码.
-     * 清完之后 g_is_activated = false, exit(0) 结束进程. */
+/* 在后台队列同步结束进程.
+ *
+ * 重要 — 为什么之前「到期了进程不结束」:
+ *   旧逻辑用 dispatch_async(main_queue, ^{ exit(0) }) 回调自杀.
+ *   如果主线程刚好卡住 (主界面渲染 / 长阻塞 / 模态视图), 这个 block 就
+ *   永远排不上队 → 到期检测到了, 但 exit(0) 永远不执行 → 进程不死.
+ *
+ * 修复: 直接在 watchdog 线程(后台 QOS utility)同步写 KC + exit(0).
+ *   - Keychain API 是线程安全的 (SecItem* 内部自带锁).
+ *   - exit(0) 会触发 libc 终止, 不依赖任何 runloop / 主线程.
+ *   - ARC 对 __strong 局部变量在 @autoreleasepool 作用域结束后也会自动 release,
+ *     进程一死也用不着担心释放顺序.
+ */
+static void watchdog_kill_now(void) {
     kc_set_string(@(KC_ACTIVE_CARD),       @"");
     kc_set_string(@(KC_ACTIVE_EXPIRE_TS),  @"");
     kc_set_string(@(KC_TIME_CHECK_REC),    @"");
     g_is_activated = false;
+    /* 留一条日志便于定位 (Console 可见). */
+    NSLog(@"[card_auth] watchdog: terminating process NOW (pid=%d)", getpid());
     exit(0);
+}
+
+/* 初始化栅栏: 最多等 WATCHDOG_INIT_WAIT_MS ms, 返回 true = check_authorization 已跑完.
+ * 把自旋逻辑抽出来便于单测 / 改步长. */
+static bool watchdog_wait_init(void) {
+    const int step_ms = 100;
+    int waited = 0;
+    while (!g_init_done && waited < WATCHDOG_INIT_WAIT_MS) {
+        usleep(step_ms * 1000);
+        waited += step_ms;
+    }
+    return g_init_done;
 }
 
 static void watchdog_loop(void) {
     @autoreleasepool {
-        /* 第一道栅栏: 等 check_authorization (主线程 dispatch_async) 跑完, 再开始 tick.
-         * 用 100ms 步长 + 最多 10 秒的自旋, 避免极个别情况 (App 没构造 UI) 卡死 watchdog. */
-        int waited = 0;
-        while (!g_init_done && waited < 10000) {
-            usleep(100 * 1000);  /* 100 ms */
-            waited += 100;
-        }
+        /* 第一道栅栏: 等 check_authorization (主线程 dispatch_async) 跑完,
+         * 再开始 tick. 防止启动期抢跑, 把"刚激活的 KC"误判死. */
         if (!g_init_done) {
-            NSLog(@"[card_auth] watchdog: init not done after 10s, skipping this tick");
-            goto __next;
+            if (!watchdog_wait_init()) {
+                NSLog(@"[card_auth] watchdog: init not done after %dms, schedule next tick",
+                      WATCHDOG_INIT_WAIT_MS);
+                goto __next;
+            }
         }
 
+        /* ---- 1. 使用期到期检查 ---- */
         int64_t remain = watchdog_remaining_seconds();
         if (remain < 0) {
-            /* 已过期: 不做任何 UI 提示, 直接杀进程结束软件.
-             * watchdog_kill 内部已清 KC, 下次启动是干净的激活窗口. */
-            NSLog(@"[card_auth] watchdog: EXPIRED %lld seconds ago, terminating now", -remain);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                watchdog_kill();
-            });
-            return;
+            NSLog(@"[card_auth] watchdog: EXPIRED %lld seconds ago, terminating", -remain);
+            watchdog_kill_now();   /* 同步结束, 不切主线程, 不死锁 */
+            return;                /* 理论上不会到这里, exit 已经把进程带走 */
         }
+        /* 还剩不到 1 个检查间隔 → 缩短到 1 秒再查, 减少「最多误差一个间隔」的迟滞 */
+        int next_sleep = WATCHDOG_INTERVAL_SEC;
+        if (remain > 0 && remain < next_sleep) next_sleep = 1;
 
-        /* 时间篡改: 每轮 watchdog 也顺手查一次, 防止用户用着用着改时间继续用.
-         * 算法与 check_authorization 一致. 检测到直接杀进程, 无 UI 提示. */
+        /* ---- 2. 时间篡改检测 ---- */
         NSString *rec_json = kc_get_string(@(KC_TIME_CHECK_REC));
         if (rec_json && rec_json.length > 0) {
             int64_t last_check_time = 0, last_boottime = 0;
@@ -1027,9 +1047,7 @@ static void watchdog_loop(void) {
                 if (diff < 0) diff = -diff;
                 if (diff > TIME_TAMPER_THRESHOLD) {
                     NSLog(@"[card_auth] watchdog: time tamper detected (diff=%lld), terminating", diff);
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        watchdog_kill();
-                    });
+                    watchdog_kill_now();
                     return;
                 }
                 NSDictionary *new_rec = @{
@@ -1041,9 +1059,17 @@ static void watchdog_loop(void) {
                 kc_set_string(@(KC_TIME_CHECK_REC), nj);
             }
         }
+
+        /* ---- 3. 下一轮调度. 若快要到期则改 1 秒轮询更准 ---- */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                       (int64_t)(next_sleep * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                       ^{ watchdog_loop(); });
+        return;   /* 不走 __next, 下一轮在 dispatch_after 上面直接启动 */
     }
 
 __next:
+    /* 仅 init 未完成 时走这里: 一个完整间隔后再重试. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                    (int64_t)(WATCHDOG_INTERVAL_SEC * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
