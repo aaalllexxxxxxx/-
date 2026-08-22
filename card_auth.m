@@ -1,9 +1,9 @@
 /*
- * card_auth.m — TrollStore-R 本地卡密校验 Dylib (短卡密 v2)
+ * card_auth.m — TrollStore 本地激活码校验 Dylib (短卡密 v3: 激活时才开始算时间)
  * Target: arm64-apple-ios
  * Dependencies: UIKit, Security.framework, Foundation, CommonCrypto
  * Constructor Priority: __attribute__((constructor(101)))
- *
+ */
  * 新版 16 位短卡密 (大小写字母 + 数字, 共 62 种字符, 不含分隔符):
  *   [档位2位][载荷7位][校验3位][尾码4位]
  *     S3/M1/H1/H3/D1/W7/M3/M9/Y1/Y0 共 10 个档位
@@ -30,6 +30,8 @@
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <string.h>
+#import <unistd.h>          /* usleep, 用于 watchdog 初始栅栏自旋 */
+#import <sys/time.h>        /* gettimeofday, timeval */
 
 /* =========================================================
  *  硬性编码约束
@@ -56,6 +58,10 @@ static const char g_b62_chars[63] =
 
 /* ---- 全局状态 ---- */
 static bool g_is_activated = false;
+/* g_init_done: check_authorization 执行完后置 true.
+ * watchdog 启动后第一次 tick 必须等它完成, 否则启动期 Keychain 还没完成校验,
+ * 就可能因为"上次运行到期未清记录"被 watchdog 抢先 exit, 形成「双击就闪退」的死循环. */
+static volatile bool g_init_done = false;
 
 /* ---- Keychain Service 标识 ---- */
 #define KC_SERVICE            "com.nbxy.app.cardauth"
@@ -779,25 +785,27 @@ static void show_auth_window_on_main(void) {
 
 static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        /* 致命场景: 先清掉旧激活记录, 弹出激活窗口并在顶部提示.
-         * 注意: 此处绝对不能调用 exit(0), 也不能弹 UIAlert(易闪退).
-         *       正确做法是把用户留在激活窗口, g_is_activated 保持 false,
-         *       sendEvent 会继续拦截触摸, 用户无法进入主界面. */
-        kc_set_string(@(KC_ACTIVE_CARD),      @"");
-        kc_set_string(@(KC_ACTIVE_EXPIRE_TS), @"");
-        kc_set_string(@(KC_TIME_CHECK_REC),   @"");
-
+        /* 致命场景: 先清掉旧激活记录 (KC_ACTIVE_CARD / EXPIRE_TS / TIME_CHECK_REC 由
+         * show_fatal 触发者负责在外围清, 或者 watchdog_kill / check_authorization 清),
+         * 复用 show_auth_window_on_main 创建同一个激活窗 (如果不存在就创建).
+         * 之后再在其顶部贴黄条提示原因.
+         *
+         * 好处:
+         *   - 致命路径与正常激活路径共用 g_auth_window, 不会出现
+         *     "fatal 里新造一个 window、sendEvent 却判的是另一个"的穿透 bug.
+         *   - 黄条上写原因, 但输入框和所有按钮仍可用, 用户可以直接输入新激活码重激活.
+         *   - 不调用 exit, 不弹 UIAlert, 不会出现一闪而退的问题. */
         if (!g_auth_window) {
-            g_auth_window = [[CardAuthWindow alloc] init];
-            UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-            win.windowLevel = UIWindowLevelAlert + 100;
-            win.rootViewController = g_auth_window;
-            g_auth_window.window = win;
-            win.hidden = NO;
-            [win makeKeyAndVisible];
+            show_auth_window_on_main();
         }
-        /* 在激活窗口顶部显示原因 */
-        [g_auth_window showStickyInfo:title detail:detail];
+        /* show_auth_window_on_main 内部是 dispatch_async 创建,
+         * 所以这里再 dispatch_once_async_after 一个微任务, 保证 VC 已构建,
+         * 再展示 sticky. */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (g_auth_window) {
+                [g_auth_window showStickyInfo:title detail:detail];
+            }
+        });
     });
 }
 
@@ -816,13 +824,13 @@ static void check_authorization(void) {
         (!active_cd || active_cd.length == 0)) {
         g_is_activated = false;
         show_auth_window_on_main();
-        return;
+        goto __done;   /* 未激活路径: 依然要放行 watchdog (用户激活后 watchdog 要生效) */
     }
     if (!exp_str || exp_str.length == 0) {
         /* 老数据 (v2 只写 KC_ACTIVE_CARD): 视为不完整, 强制重激活 */
         g_is_activated = false;
         show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
-        return;
+        goto __done;
     }
 
     /* 2. 解析到期时间戳 (主判定依据). longLongValue 解析失败返回 0, 会被下一个分支自然拦住 */
@@ -832,7 +840,7 @@ static void check_authorization(void) {
     if (stored_expire_ts <= 0 || now > stored_expire_ts) {
         g_is_activated = false;
         show_fatal_alert_on_main(@"使用期限已到", @"请联系客服获取新的激活码");
-        return;
+        goto __done;
     }
 
     /* 3. 可选二次校验: 激活码原文 CRC+尾码 仍然合法 (不通过激活窗口判断, 只判断格式/密钥)
@@ -840,16 +848,13 @@ static void check_authorization(void) {
      *    的过期判定 (因为 activation window 是针对"首次激活"的, 已经激活过的
      *    KC_ACTIVE_CARD 肯定老早就超过窗口, 用窗口判断就错了). */
     if (active_cd && active_cd.length == 16) {
-        /* 走格式+CRC+尾码 的"结构级"核验, 不关心 gen_ts 的时效性. 为此
-         * 直接调用 validate_card_ex 后, 忽略 CAR_ERR_EXPIRED (超激活窗口),
-         * 只在结构本身损坏 (CAR_ERR_GENERIC) 时判失败. */
         int car = CAR_OK;
         BOOL good = validate_card_ex(active_cd, NULL, NULL, NULL, NULL, &car);
         if (!good && car != CAR_ERR_EXPIRED) {
             NSLog(@"[card_auth] saved active card corrupted (reason=%d)", car);
             g_is_activated = false;
             show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
-            return;
+            goto __done;
         }
     }
 
@@ -878,7 +883,7 @@ static void check_authorization(void) {
         if (diff > TIME_TAMPER_THRESHOLD) {
             g_is_activated = false;
             show_fatal_alert_on_main(@"系统时间异常", @"请确认手机时间正确后重试");
-            return;
+            goto __done;
         }
     }
 
@@ -895,6 +900,15 @@ static void check_authorization(void) {
     NSString *new_rec_json = [[NSString alloc] initWithData:new_rec_data
                                                   encoding:NSUTF8StringEncoding];
     kc_set_string(@(KC_TIME_CHECK_REC), new_rec_json);
+
+__done:
+    /* 所有路径统一抵达: 放行 watchdog 第一次 tick.
+     *   放在这里有两个关键作用:
+     *     1) 启动期未完成时, 不会被 watchdog 抢先读取"上次到期未清"的 KC 然后 exit,
+     *        避免「双击就闪退 / 再也进不去」的死循环.
+     *     2) 任何 fatal 结束路径都保证 g_init_done=true, 之后用户成功重新激活,
+     *        watchdog 的运行期到期 / 篡改监测依然能照常工作. */
+    g_init_done = true;
 }
 
 /* =========================================================
@@ -949,16 +963,38 @@ static int64_t watchdog_remaining_seconds(void) {
 }
 
 static void watchdog_kill(void) {
-    /* 标记失效 -> 触摸拦截立即生效 -> 进程自杀 */
+    /* 关键顺序: 自杀前必须先把 Keychain 中「会让 check_authorization 误判的记录」清空.
+     *   - 如果不清 KC_ACTIVE_EXPIRE_TS: 下次启动, watchdog 的第一次 tick 会在
+     *     check_authorization 跑到 fatal 路径之前就再次看到过期的时间戳 -> 再次 exit(0)
+     *     -> 无限循环 "双击闪退", 激活窗永远显示不出来.
+     *   - 同步清 ACTIVE_CARD / TIME_CHECK_REC: 下次启动直接走干净的 show_auth_window_on_main
+     *     (无 KC = 新用户状态), 用户可以立刻输入新激活码.
+     * 清完之后 g_is_activated = false, exit(0) 结束进程. */
+    kc_set_string(@(KC_ACTIVE_CARD),       @"");
+    kc_set_string(@(KC_ACTIVE_EXPIRE_TS),  @"");
+    kc_set_string(@(KC_TIME_CHECK_REC),    @"");
     g_is_activated = false;
     exit(0);
 }
 
 static void watchdog_loop(void) {
     @autoreleasepool {
+        /* 第一道栅栏: 等 check_authorization (主线程 dispatch_async) 跑完, 再开始 tick.
+         * 用 100ms 步长 + 最多 10 秒的自旋, 避免极个别情况 (App 没构造 UI) 卡死 watchdog. */
+        int waited = 0;
+        while (!g_init_done && waited < 10000) {
+            usleep(100 * 1000);  /* 100 ms */
+            waited += 100;
+        }
+        if (!g_init_done) {
+            NSLog(@"[card_auth] watchdog: init not done after 10s, skipping this tick");
+            goto __next;
+        }
+
         int64_t remain = watchdog_remaining_seconds();
         if (remain < 0) {
-            /* 已过期: 不做任何 UI 提示, 直接杀进程结束软件 */
+            /* 已过期: 不做任何 UI 提示, 直接杀进程结束软件.
+             * watchdog_kill 内部已清 KC, 下次启动是干净的激活窗口. */
             NSLog(@"[card_auth] watchdog: EXPIRED %lld seconds ago, terminating now", -remain);
             dispatch_async(dispatch_get_main_queue(), ^{
                 watchdog_kill();
@@ -993,7 +1029,6 @@ static void watchdog_loop(void) {
                     });
                     return;
                 }
-                /* 顺便把 last_check_time 更新成 now, 避免"墙钟 - 开机时间"累积误报 */
                 NSDictionary *new_rec = @{
                     @"last_check_time": @(now),
                     @"last_boottime":   @(boot_sec)
@@ -1005,7 +1040,7 @@ static void watchdog_loop(void) {
         }
     }
 
-    /* 下一轮调度: 用一次 dispatch_after 串行, 避免多条 timer 叠跑 */
+__next:
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                    (int64_t)(WATCHDOG_INTERVAL_SEC * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
