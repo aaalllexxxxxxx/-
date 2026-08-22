@@ -754,11 +754,66 @@ static CardAuthWindow *g_auth_window = nil;
  *  弹窗辅助函数
  * ========================================================= */
 
+/*
+ * 获取当前激活的 UIWindowScene（iOS 13+ Scene-based app 用）。
+ * 老式 app（UIApplicationDelegate）没有 scene，返回 nil。
+ * 返回 nil 时调用方应回退到老式 makeKeyAndVisible 流程。
+ */
+static UIWindowScene *get_active_window_scene(void) {
+    /* UIApplication.connectedScenes 在 iOS 13+ 才有。
+     * 用 NSSelectorFromString + respondsToSelector 做运行时判断,
+     * 保证 dylib 在 iOS 12 及以下也能加载（不会因找不到方法而崩溃）。 */
+    Class UIApplicationCls = objc_getClass("UIApplication");
+    if (!UIApplicationCls) return nil;
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return nil;
+
+    SEL sel = NSSelectorFromString(@"connectedScenes");
+    if (![app respondsToSelector:sel]) return nil;  /* iOS 13 以下 */
+
+    /* [app connectedScenes] 返回 NSSet<UIScene *> */
+    NSSet *scenes = ((NSSet *(*)(id, SEL))objc_msgSend)(app, sel);
+    if (!scenes || scenes.count == 0) return nil;
+
+    for (UIScene *scene in scenes) {
+        /* 只取前台激活的 UIWindowScene */
+        if (![scene isKindOfClass:objc_getClass("UIWindowScene")]) continue;
+
+        /* scene.activationState: UISceneActivationStateForegroundActive=3 */
+        SEL stateSel = NSSelectorFromString(@"activationState");
+        if ([scene respondsToSelector:stateSel]) {
+            NSUInteger state = ((NSUInteger (*)(id, SEL))objc_msgSend)(scene, stateSel);
+            if (state != 3) continue;  /* 只用 active 的 */
+        }
+
+        return (UIWindowScene *)scene;
+    }
+    /* 没找到 active 的, 退而求其次取第一个 UIWindowScene */
+    for (UIScene *scene in scenes) {
+        if ([scene isKindOfClass:objc_getClass("UIWindowScene")]) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    return nil;
+}
+
 static void show_auth_window_on_main(void) {
     if (g_auth_window) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         g_auth_window = [[CardAuthWindow alloc] init];
-        UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+
+        /* 关键修复: iOS 13+ Scene-based app 必须把 window 关联到 UIWindowScene,
+         * 否则 makeKeyAndVisible 创建的是"孤儿 window", 屏幕上看不到。
+         * 老式 app (UIApplicationDelegate, 无 connectedScenes) 仍走 makeKeyAndVisible。 */
+        UIWindowScene *scene = get_active_window_scene();
+        UIWindow *win = nil;
+        if (scene) {
+            /* Scene-based app: 用 initWithWindowScene: 创建 window */
+            win = [[UIWindow alloc] initWithWindowScene:scene];
+        } else {
+            /* 老式 app: 回退到 initWithFrame: */
+            win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        }
         win.windowLevel = UIWindowLevelAlert + 100;
         win.rootViewController = g_auth_window;
         g_auth_window.window = win;
