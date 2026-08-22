@@ -317,7 +317,7 @@ static CardAuthWindow *g_auth_window = nil;
 
     /* 1. 提示标签 */
     self.hintLabel = [[UILabel alloc] init];
-    self.hintLabel.text = @"请输入卡密激活\n通用: S30-G-xxx / D1-G-xxx / H1-G-xxx\n绑定: D1-B-xxx / H1-B-xxx / W7-B-xxx";
+    self.hintLabel.text = @"请输入卡密激活";
     self.hintLabel.numberOfLines = 0;
     self.hintLabel.font = [UIFont systemFontOfSize:13];
     self.hintLabel.textColor = [UIColor whiteColor];
@@ -327,7 +327,7 @@ static CardAuthWindow *g_auth_window = nil;
 
     /* 2. 卡密输入框 */
     self.inputField = [[UITextField alloc] init];
-    self.inputField.placeholder = @"输入卡密 (如 D1-G-xxxx)";
+    self.inputField.placeholder = @"输入卡密";
     self.inputField.borderStyle = UITextBorderStyleRoundedRect;
     self.inputField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
     self.inputField.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -723,10 +723,24 @@ static void check_authorization(void) {
 
 static void (*orig_sendEvent)(id, SEL, UIEvent *) = NULL;
 
-/* Hook 实现: 未激活时丢弃全部触摸事件 */
+/* Hook 实现: 未激活时丢弃 App 触摸事件, 但放行弹窗自身的触摸 */
 static void hook_sendEvent(id self, SEL _cmd, UIEvent *event) {
     if (!g_is_activated) {
-        /* 丢弃所有触摸事件, 按钮完全不可点击 */
+        /* 未激活: 检查触摸是否落在弹窗 window 上
+         * 如果是弹窗自身的触摸 (输入框/按钮), 放行;
+         * 否则丢弃, 防止用户操作 App 功能 */
+        if (g_auth_window && g_auth_window.window) {
+            /* 遍历事件中的所有触摸, 检查是否有落在弹窗 window 上的 */
+            NSSet *touches = [event touchesForWindow:g_auth_window.window];
+            if (touches && touches.count > 0) {
+                /* 弹窗自身的触摸, 放行 */
+                if (orig_sendEvent) {
+                    orig_sendEvent(self, _cmd, event);
+                }
+                return;
+            }
+        }
+        /* 非弹窗触摸, 丢弃 */
         return;
     }
     if (orig_sendEvent) {
