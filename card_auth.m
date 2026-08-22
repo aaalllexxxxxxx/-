@@ -1,33 +1,22 @@
 /*
- * card_auth.m — TrollStore-R 本地卡密校验 Dylib
+ * card_auth.m — TrollStore-R 本地卡密校验 Dylib (短卡密 v2)
  * Target: arm64-apple-ios
  * Dependencies: UIKit, Security.framework, Foundation, CommonCrypto
  * Constructor Priority: __attribute__((constructor(101)))
  *
- * 卡密规范摘要:
- *   档位: S30 M1 H1 H3 D1 W7 M30 M90 Y1 Y10
- *   通用卡密(G):  PREFIX:G:Fernet(到期Unix时间戳)
- *   绑定卡密(B):  PREFIX:B:Fernet(到期时间戳||identifierForVendor)
- *   全部档位均支持 G 通用 / B 绑定 两种类型
- *   分隔符为 ':', 不与 Fernet base64url 字符集冲突
- *
- * 固有局限（纯本地无服务器，逆向可Hook绕过，清空钥匙串重置本地状态）:
- *   1. G 通用卡密支持多设备共用; B 绑定卡密仅限指定设备
- *   2. 绑定卡密仅软件层校验; 逆向可以 Hook identifierForVendor 伪造设备ID绕过
- *   3. 用户清空 App 钥匙串, 本机黑名单/授权记录全部丢失, 可重复使用旧卡密
- *   4. boottime 不能防御关机后修改系统时间
- *   5. 本地方案无法实现全局一次性消耗卡密, 需要服务器数据库
- *   6. S30/M1 测试档位仅供内部调试, 不对外分发
- *   7. 剪贴板复制依赖 iOS 系统 API, 巨魔环境可用
+ * 新版 16 位短卡密 (大小写字母 + 数字, 共 62 种字符, 不含分隔符):
+ *   [档位2位][载荷7位][校验3位][尾码4位]
+ *     S3/M1/H1/H3/D1/W7/M3/M9/Y1/Y0 共 10 个档位
+ *     载荷  : Base62( 32bit 到期Unix时间戳 XOR 密钥派生流 )
+ *     校验  : Base62( CRC16_XMODEM(档位+载荷) XOR 混淆常量 (低16位) + 高2位混淆 )
+ *     尾码  : G=HMAC(KEY, "G:"+档位+载荷+校验)[0:20bit]
+ *             B=HMAC(KEY, "B:"+设备ID+档位+载荷+校验)[0:20bit]
  *
  * 编译: clang -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
  *       -framework UIKit -framework Security -framework Foundation \
  *       -dynamiclib card_auth.m -o card_auth.dylib
  *
  * 编译后使用 ldid 签名: ldid -S card_auth.dylib
- *
- * 注意: 文件扩展名必须为 .m (Objective-C), 不能用 .c
- *       否则 clang 按 C 语言编译, 无法识别 @class/@protocol 等语法
  */
 
 #import <Foundation/Foundation.h>
@@ -36,6 +25,7 @@
 #import <objc/message.h>
 #import <Security/Security.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <CommonCrypto/CommonHMAC.h>
 #import <sys/sysctl.h>
 #import <dlfcn.h>
 #import <stdlib.h>
@@ -43,57 +33,59 @@
 
 /* =========================================================
  *  硬性编码约束
- *  - AES 密钥使用 uint8_t 字节数组, 禁止明文
+ *  - 密钥使用 uint8_t 字节数组, 禁止明文
  *  - 全部授权数据存放 Keychain, 禁止沙盒文件
- *  - 不引入 Frida/Gadget 组件
  *  - 失败场景调用 exit(0)
  *  - UI / 剪贴板操作全部 dispatch_async 到主线程
  * ========================================================= */
 
-/* ---- Fernet 密钥: 32 字节, 以 uint8_t 数组存放, 禁止明文 ----
- * 开发者应替换为自己的随机 32 字节密钥。
- * 此数组在编译后以机器码形式存在于 dylib 中, 不以明文字符串出现。
- * 生成方法: python -c "import os; print(list(os.urandom(32)))"
- */
-static const uint8_t g_fernet_key[32] = {
+/* ---- 卡密主密钥: 32 字节, 必须与 gen_card.py 中 CARD_KEY_BYTES 完全一致 ---- */
+static const uint8_t g_card_key[32] = {
     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
     0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
     0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
 };
 
+/* ---- Base62 字符表 ---- */
+static const char g_b62_chars[63] =
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/* ---- CRC 混淆常量 ---- */
+#define CRC_OBFUSCATOR      0x2A5F37u
+
 /* ---- 全局状态 ---- */
-static bool g_is_activated = false;   /* 默认未激活 */
+static bool g_is_activated = false;
 
 /* ---- Keychain Service 标识 ---- */
 #define KC_SERVICE            "com.nbxy.app.cardauth"
-#define KC_EXPIRE_CIPHER      "expire_cipher"
-#define KC_USED_CARD_LIST     "used_card_list"
-#define KC_TIME_CHECK_REC     "time_check_record"
-#define KC_LOCAL_DEVICE_ID    "local_device_id"
+#define KC_ACTIVE_CARD        "active_card"          /* 当前激活的完整 16 位卡密 */
+#define KC_USED_CARD_LIST     "used_card_list"       /* 本机黑名单 */
+#define KC_TIME_CHECK_REC     "time_check_record"    /* 时间篡改记录 */
+#define KC_LOCAL_DEVICE_ID    "local_device_id"      /* 设备 ID 缓存 */
 
-/* ---- 前缀 → 秒数映射 ---- */
+/* ---- 前缀 → 秒数映射 (新两位档位码) ---- */
 typedef struct {
     const char *prefix;
     int64_t seconds;
 } duration_entry_t;
 
 static const duration_entry_t g_duration_table[] = {
-    { "S30", 30LL },
-    { "M1",  60LL },
-    { "H1",  3600LL },
-    { "H3",  10800LL },
-    { "D1",  86400LL },
-    { "W7",  604800LL },
-    { "M30", 2592000LL },
-    { "M90", 7776000LL },
-    { "Y1",  31536000LL },
-    { "Y10", 315360000LL },
+    { "S3",  30LL         },
+    { "M1",  60LL         },
+    { "H1",  3600LL       },
+    { "H3",  10800LL      },
+    { "D1",  86400LL      },
+    { "W7",  604800LL     },
+    { "M3",  2592000LL    },
+    { "M9",  7776000LL    },
+    { "Y1",  31536000LL   },
+    { "Y0",  315360000LL  },
 };
 static const int g_duration_table_count =
-    sizeof(g_duration_table) / sizeof(g_duration_table[0]);
+    (int)(sizeof(g_duration_table) / sizeof(g_duration_table[0]));
 
-/* 时间篡改阈值: 2 天 = 172800 秒 */
+/* ---- 时间篡改阈值: 2 天 = 172800 秒 ---- */
 #define TIME_TAMPER_THRESHOLD 172800
 
 /* =========================================================
@@ -101,7 +93,6 @@ static const int g_duration_table_count =
  * ========================================================= */
 
 /* --- 1. Keychain 字符串读写 --- */
-
 static NSString *kc_get_string(NSString *key) {
     NSDictionary *query = @{
         (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
@@ -138,7 +129,6 @@ static bool kc_set_string(NSString *key, NSString *value) {
 }
 
 /* --- 2. Keychain 数组读写（used_card_list 黑名单）--- */
-
 static NSArray *kc_get_array(NSString *key) {
     NSString *json = kc_get_string(key);
     if (!json) return @[];
@@ -155,25 +145,21 @@ static bool kc_set_array(NSString *key, NSArray *array) {
 }
 
 /* --- 3. boottime 获取: sysctl KERN_BOOTTIME --- */
-
 static struct timeval get_boottime(void) {
     struct timeval boot = {0, 0};
     int mib[2] = {CTL_KERN, KERN_BOOTTIME};
     size_t size = sizeof(boot);
     if (sysctl(mib, 2, &boot, &size, NULL, 0) != 0) {
-        /* 失败则返回零值, 触发后续校验逻辑 */
+        /* 失败返回零值 */
     }
     return boot;
 }
 
 /* --- 4. 获取并缓存 identifierForVendor --- */
-
 static NSString *get_local_device_id(void) {
-    /* 先读 Keychain 缓存 */
     NSString *cached = kc_get_string(@(KC_LOCAL_DEVICE_ID));
     if (cached && cached.length > 0) return cached;
 
-    /* 调用系统 API: 必须主线程 */
     __block NSString *idf = nil;
     if ([NSThread isMainThread]) {
         idf = [UIDevice currentDevice].identifierForVendor.UUIDString;
@@ -189,154 +175,258 @@ static NSString *get_local_device_id(void) {
 }
 
 /* --- 5. 剪贴板工具 --- */
-
 static void copy_to_clipboard(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [UIPasteboard generalPasteboard].string = text;
     });
 }
 
-/* --- 6. Base64 URL-safe 解码 (Fernet token 使用 URL-safe base64) --- */
-
-static NSData *base64url_decode(NSString *b64) {
-    if (!b64) return nil;
-    NSMutableString *s = [b64 mutableCopy];
-    [s replaceOccurrencesOfString:@"-" withString:@"+" options:0
-                        range:NSMakeRange(0, s.length)];
-    [s replaceOccurrencesOfString:@"_" withString:@"/" options:0
-                        range:NSMakeRange(0, s.length)];
-    NSInteger r = s.length % 4;
-    if (r > 0) {
-        [s appendString:[@"====" substringToIndex:(4 - r)]];
-    }
-    /* NSDataBase64DecodingIgnoreUnknownCharacters 忽略字符串中
-     * 非法字符 (如换行、空格), 更鲁棒 */
-    NSData *decoded = [[NSData alloc] initWithBase64EncodedString:s
-              options:NSDataBase64DecodingIgnoreUnknownCharacters];
-    if (!decoded) {
-        NSLog(@"[card_auth] base64 decode failed, input len=%lu, first 20 chars: %@",
-              (unsigned long)s.length, [s substringToIndex:MIN(20, s.length)]);
-    }
-    return decoded;
-}
-
 /* =========================================================
- *  Fernet 解密模块 (纯本地实现, 与 Python cryptography 库兼容)
- *
- *  Python cryptography 库 Fernet 实现:
- *    - 32字节密钥拆分为: signing_key = key[:16], encryption_key = key[16:]
- *    - 加密: AES-128-CBC + PKCS7 padding (注意: AES-128, 不是 AES-256)
- *    - 签名: HMAC-SHA256(signing_key, version+timestamp+iv+ciphertext)
- *
- *  Fernet token 格式 (raw bytes, base64url 编码):
- *    0:  Version (0x80)
- *    1:  Timestamp (8 bytes, big-endian)
- *    9:  IV (16 bytes)
- *    25: Ciphertext (变长, 16 的倍数)
- *    最后32字节: HMAC-SHA256
- *
- *  本实现:
- *    - 跳过 HMAC 校验 (本地卡密, 非网络传输, 完整性由 Keychain 保证)
- *    - 用 AES-128-CBC 解密 (与 Python Fernet 一致)
- *    - 使用 encryption_key = g_fernet_key[16:32] (后16字节)
+ *  卡密校验核心模块 (替换 Fernet)
  * ========================================================= */
 
-/* PKCS7 unpad (block size 16 for AES) */
-static NSData *pkcs7_unpad(NSData *data) {
-    if (data.length == 0) return nil;
-    const uint8_t *bytes = data.bytes;
-    uint8_t pad = bytes[data.length - 1];
-    if (pad == 0 || pad > 16 || pad > data.length) return nil;
-    for (int i = 0; i < pad; i++) {
-        if (bytes[data.length - 1 - i] != pad) return nil;
-    }
-    return [NSData dataWithBytes:bytes length:(data.length - pad)];
+/* Base62 字符 -> 数字 (0-61), 非法返回 -1 */
+static int b62_char_ord(char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');                     /* 0-9: 0~9   */
+    if (c >= 'A' && c <= 'Z') return (int)(c - 'A') + 10;                /* A-Z: 10~35 */
+    if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 36;                /* a-z: 36~61 */
+    return -1;
 }
 
-/* AES-128-CBC 解密 (key=16 bytes, iv=16 bytes) */
-static NSData *aes128_cbc_decrypt(NSData *cipher, NSData *key, NSData *iv) {
-    if (cipher.length == 0 || cipher.length % 16 != 0) {
-        NSLog(@"[card_auth] aes: bad cipher len=%lu", (unsigned long)cipher.length);
-        return nil;
+/* Base62 字符串解码为 uint64, 成功返回 true, out=结果 */
+static bool b62_decode(const char *s, int len, uint64_t *out) {
+    uint64_t val = 0;
+    for (int i = 0; i < len; i++) {
+        int d = b62_char_ord(s[i]);
+        if (d < 0) return false;
+        val = val * 62ULL + (uint64_t)d;
     }
-    if (key.length != 16 || iv.length != 16) {
-        NSLog(@"[card_auth] aes: bad key/iv len key=%lu iv=%lu",
-              (unsigned long)key.length, (unsigned long)iv.length);
-        return nil;
+    *out = val;
+    return true;
+}
+
+/* CRC-16-XMODEM: poly 0x1021, init 0x0000, no reflection, no final xor */
+static uint16_t crc16_xmodem(const uint8_t *data, size_t len) {
+    uint16_t crc = 0x0000;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)((uint16_t)data[i] << 8);
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x8000u) {
+                crc = (uint16_t)((crc << 1) ^ 0x1021u);
+            } else {
+                crc = (uint16_t)(crc << 1);
+            }
+        }
     }
-    NSMutableData *out = [NSMutableData dataWithLength:cipher.length];
-    size_t out_moved = 0;
-    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0,
-                                  key.bytes, kCCKeySizeAES128,
-                                  iv.bytes,
-                                  cipher.bytes, cipher.length,
-                                  out.mutableBytes, out.length, &out_moved);
-    NSLog(@"[card_auth] aes: CCCrypt status=%d, out_moved=%zu, cipher_len=%lu",
-          st, out_moved, (unsigned long)cipher.length);
-    if (st != kCCSuccess) return nil;
-    NSData *unpadded = pkcs7_unpad(out);
-    if (!unpadded) {
-        NSLog(@"[card_auth] aes: pkcs7_unpad nil, out_len=%lu, last_byte=0x%02x",
-              (unsigned long)out.length, ((const uint8_t *)out.bytes)[out.length - 1]);
-    }
-    return unpadded;
+    return crc;
 }
 
 /*
- * Fernet 解密: 输入 token 字符串, 输出明文 bytes
- * 返回 nil 表示解密失败
- *
- * 兼容 Python cryptography 库 Fernet 实现:
- *   signing_key = key[:16]
- *   encryption_key = key[16:]
- *   token = base64url(0x80 + timestamp(8B) + IV(16B) + ciphertext + HMAC(32B))
+ * HMAC-SHA256 便捷封装.
+ * digest_out: 至少 CC_SHA256_DIGEST_LENGTH (32) 字节
  */
-static NSData *fernet_decrypt(NSString *token_str) {
-    if (!token_str || token_str.length == 0) {
-        NSLog(@"[card_auth] fernet_decrypt: nil/empty input");
-        return nil;
+static void hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *msg, size_t msg_len,
+                        uint8_t *digest_out) {
+    CCHmacContext ctx;
+    CCHmacInit(&ctx, kCCHmacAlgSHA256, key, key_len);
+    CCHmacUpdate(&ctx, msg, msg_len);
+    CCHmacFinal(&ctx, digest_out);
+}
+
+/* 解析档位前缀秒数, 未找到返回 0 */
+static int64_t lookup_duration(const char *prefix2) {
+    for (int i = 0; i < g_duration_table_count; i++) {
+        if (prefix2[0] == g_duration_table[i].prefix[0] &&
+            prefix2[1] == g_duration_table[i].prefix[1]) {
+            return g_duration_table[i].seconds;
+        }
+    }
+    return 0;
+}
+
+/*
+ * 派生 XOR 密钥流 (4 字节).
+ * 算法: HMAC-SHA256(g_card_key, "XOR:"+prefix2+":"+type+":"+device_id_or_empty)[0:4]
+ * type: "G" or "B"
+ */
+static void derive_xor_keystream(const char *prefix2, const char *type,
+                                 NSString *device_id,
+                                 uint8_t ks_out[4]) {
+    NSMutableData *msg = [NSMutableData data];
+    [msg appendBytes:"XOR:" length:4];
+    [msg appendBytes:prefix2 length:2];
+    [msg appendBytes:":" length:1];
+    [msg appendBytes:type length:1];
+    [msg appendBytes:":" length:1];
+    if (device_id && device_id.length > 0) {
+        NSData *d = [device_id dataUsingEncoding:NSUTF8StringEncoding];
+        if (d) [msg appendData:d];
+    }
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    hmac_sha256(g_card_key, sizeof(g_card_key),
+                (const uint8_t *)msg.bytes, msg.length, digest);
+    memcpy(ks_out, digest, 4);
+}
+
+/*
+ * 派生 20bit 尾码.
+ * device_id=nil 代表 G 类型, 非 nil 代表 B 类型.
+ * 返回值 0 ~ 1048575 (< 62^4)
+ */
+static uint32_t derive_20bit_tail(const char *prefix2,
+                                  const char *cipher7,
+                                  const char *crc3,
+                                  NSString *device_id) {
+    NSMutableData *msg = [NSMutableData data];
+    if (device_id && device_id.length > 0) {
+        /* B: "B:" + device_id + prefix2 + cipher7 + crc3 */
+        [msg appendBytes:"B:" length:2];
+        NSData *d = [device_id dataUsingEncoding:NSUTF8StringEncoding];
+        if (d) [msg appendData:d];
+    } else {
+        /* G: "G:" + prefix2 + cipher7 + crc3 */
+        [msg appendBytes:"G:" length:2];
+    }
+    [msg appendBytes:prefix2 length:2];
+    [msg appendBytes:cipher7  length:7];
+    [msg appendBytes:crc3     length:3];
+
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    hmac_sha256(g_card_key, sizeof(g_card_key),
+                (const uint8_t *)msg.bytes, msg.length, digest);
+    /* 前 3 字节 24bit, 取高 20bit */
+    uint32_t v = ((uint32_t)digest[0] << 16) |
+                 ((uint32_t)digest[1] << 8)  |
+                  (uint32_t)digest[2];
+    return v >> 4;
+}
+
+/*
+ * 验证一张卡密, 若成功返回到期时间戳 (>0), 失败返回 0.
+ * 若返回 >0, *out_type 会被赋值为 'G' 或 'B'.
+ */
+static int64_t validate_card(NSString *card_str, char *out_type) {
+    if (out_type) *out_type = 0;
+    if (!card_str || card_str.length != 16) {
+        NSLog(@"[card_auth] invalid card length (expect 16)");
+        return 0;
+    }
+    const char *cstr = card_str.UTF8String;
+    if (!cstr) return 0;
+    if (strlen(cstr) != 16) return 0;
+
+    /* 1. 校验所有字符都是合法 base62 */
+    for (int i = 0; i < 16; i++) {
+        if (b62_char_ord(cstr[i]) < 0) {
+            NSLog(@"[card_auth] invalid char at pos %d: '%c'", i, cstr[i]);
+            return 0;
+        }
     }
 
-    NSData *raw = base64url_decode(token_str);
-    if (!raw) {
-        NSLog(@"[card_auth] fernet_decrypt: base64url_decode nil");
-        return nil;
-    }
-    if (raw.length < 33) {
-        NSLog(@"[card_auth] fernet_decrypt: raw too short (%lu < 33)", (unsigned long)raw.length);
-        return nil;
+    /* 2. 切片 */
+    const char *prefix2 = cstr;       /* [0,2) */
+    const char *cipher7 = cstr + 2;   /* [2,9) */
+    const char *crc3    = cstr + 9;   /* [9,12) */
+    const char *tail4   = cstr + 12;  /* [12,16) */
+
+    /* 3. 查档位合法性 */
+    int64_t dur = lookup_duration(prefix2);
+    if (dur <= 0) {
+        NSLog(@"[card_auth] unknown prefix: %.2s", prefix2);
+        return 0;
     }
 
-    const uint8_t *ptr = raw.bytes;
-    if (ptr[0] != 0x80) {
-        NSLog(@"[card_auth] fernet_decrypt: version 0x%02x != 0x80", ptr[0]);
-        return nil;
+    /* 4. CRC16 公开校验 */
+    uint8_t crc_src_buf[9];
+    memcpy(crc_src_buf, prefix2, 2);
+    memcpy(crc_src_buf + 2, cipher7, 7);
+    uint16_t expected_crc = crc16_xmodem(crc_src_buf, sizeof(crc_src_buf));
+
+    uint64_t crc_18 = 0;
+    if (!b62_decode(crc3, 3, &crc_18)) return 0;
+    uint16_t restored = (uint16_t)((uint32_t)crc_18 & 0xFFFFu) ^
+                        (uint16_t)(CRC_OBFUSCATOR & 0xFFFFu);
+    if (restored != expected_crc) {
+        NSLog(@"[card_auth] crc mismatch: expected %04X, got %04X",
+              expected_crc, restored);
+        return 0;
     }
 
-    /* IV at offset 9, length 16 */
-    NSData *iv = [NSData dataWithBytes:(ptr + 9) length:16];
-    /* Ciphertext at offset 25, to end minus last 32 HMAC bytes */
-    size_t ct_len = raw.length - 25 - 32;
-    if (ct_len == 0 || (ct_len % 16 != 0)) {
-        NSLog(@"[card_auth] fernet_decrypt: ct_len=%zu, raw_len=%lu", ct_len, (unsigned long)raw.length);
-        return nil;
+    /* 5. 解载荷 7字符 -> 32bit 整数 (4字节) */
+    uint64_t cipher_int = 0;
+    if (!b62_decode(cipher7, 7, &cipher_int)) return 0;
+    if (cipher_int >= 0x100000000ULL) {
+        NSLog(@"[card_auth] cipher_int overflow 32bit");
+        return 0;
     }
-    NSData *ct = [NSData dataWithBytes:(ptr + 25) length:ct_len];
+    uint8_t cipher_bytes[4];
+    cipher_bytes[0] = (uint8_t)((cipher_int >> 24) & 0xFFu);
+    cipher_bytes[1] = (uint8_t)((cipher_int >> 16) & 0xFFu);
+    cipher_bytes[2] = (uint8_t)((cipher_int >> 8)  & 0xFFu);
+    cipher_bytes[3] = (uint8_t)( cipher_int        & 0xFFu);
 
-    /* encryption_key = g_fernet_key[16:32] (后16字节, AES-128) */
-    NSData *enc_key = [NSData dataWithBytes:(g_fernet_key + 16) length:16];
-    NSData *plain = aes128_cbc_decrypt(ct, enc_key, iv);
-    if (!plain) {
-        NSLog(@"[card_auth] fernet_decrypt: aes128_cbc_decrypt nil, ct_len=%zu", ct_len);
+    /* 6. 解尾码 4字符 -> 20bit */
+    uint64_t actual_tail = 0;
+    if (!b62_decode(tail4, 4, &actual_tail)) return 0;
+    if (actual_tail > 1048575ULL) return 0; /* 20bit 上限 */
+
+    /* 7. 优先尝试 B (绑定, 如果本地有 device_id), 再尝试 G (通用).
+     *    两种类型独立派生 XOR 密钥流和尾码, 互不干扰. */
+    NSString *dev_id = get_local_device_id();
+    char match_type = 0;
+    int64_t expire_ts = 0;
+
+    const char *types[2] = { NULL, NULL };
+    NSString *devs[2]   = { nil, nil };
+    int try_count = 0;
+    if (dev_id && dev_id.length > 0) {
+        types[try_count] = "B"; devs[try_count] = dev_id; try_count++;
     }
-    return plain;
+    types[try_count] = "G"; devs[try_count] = nil; try_count++;
+
+    for (int k = 0; k < try_count; k++) {
+        uint8_t ks[4];
+        derive_xor_keystream(prefix2, types[k], devs[k], ks);
+        uint8_t plain_bytes[4];
+        for (int i = 0; i < 4; i++) plain_bytes[i] = cipher_bytes[i] ^ ks[i];
+        uint32_t ts = ((uint32_t)plain_bytes[0] << 24) |
+                      ((uint32_t)plain_bytes[1] << 16) |
+                      ((uint32_t)plain_bytes[2] << 8)  |
+                       (uint32_t)plain_bytes[3];
+
+        uint32_t exp_tail = derive_20bit_tail(prefix2, cipher7, crc3, devs[k]);
+        if (exp_tail == (uint32_t)actual_tail) {
+            match_type = types[k][0];
+            expire_ts = (int64_t)ts;
+            break;
+        }
+    }
+
+    if (match_type == 0) {
+        NSLog(@"[card_auth] tail mismatch (wrong key/type/device)");
+        return 0;
+    }
+
+    /* 8. 有效期检查: 过期卡密视为无效 (哪怕格式正确) */
+    int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+    if (expire_ts <= now) {
+        NSLog(@"[card_auth] card already expired at %lld (now=%lld)", expire_ts, now);
+        return 0;
+    }
+
+    if (out_type) *out_type = match_type;
+    return expire_ts;
 }
 
 /* =========================================================
  *  UI 弹窗模块 (模块 C) — 全部主线程
  * ========================================================= */
 
-/* 前向声明 */
+@class CardAuthWindow;
+@protocol CardAuthWindowProto
+@end
+
 @interface CardAuthWindow : UIViewController <UITextFieldDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UITextField *inputField;
@@ -359,29 +449,28 @@ static CardAuthWindow *g_auth_window = nil;
 
     /* 1. 提示标签 */
     self.hintLabel = [[UILabel alloc] init];
-    self.hintLabel.text = @"请输入卡密激活";
+    self.hintLabel.text = @"请输入16位卡密激活\n(大小写字母+数字)";
     self.hintLabel.numberOfLines = 0;
     self.hintLabel.font = [UIFont systemFontOfSize:13];
     self.hintLabel.textColor = [UIColor whiteColor];
     self.hintLabel.textAlignment = NSTextAlignmentCenter;
-    self.hintLabel.frame = CGRectMake(20, 60, sw - 40, 80);
+    self.hintLabel.frame = CGRectMake(20, 50, sw - 40, 90);
     [self.view addSubview:self.hintLabel];
 
-    /* 2. 卡密输入框 */
+    /* 2. 卡密输入框 (16位 短卡密) */
     self.inputField = [[UITextField alloc] init];
-    self.inputField.placeholder = @"输入卡密";
+    self.inputField.placeholder = @"16位卡密(字母数字,大小写敏感)";
     self.inputField.borderStyle = UITextBorderStyleRoundedRect;
-    /* 卡密是 base64url 编码, 大小写敏感, 必须禁用自动大写和自动纠错 */
     self.inputField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     self.inputField.autocorrectionType = UITextAutocorrectionTypeNo;
     self.inputField.spellCheckingType = UITextSpellCheckingTypeNo;
     self.inputField.smartQuotesType = UITextSmartQuotesTypeNo;
     self.inputField.smartDashesType = UITextSmartDashesTypeNo;
     self.inputField.delegate = self;
-    self.inputField.frame = CGRectMake(20, 155, sw - 40, 44);
+    self.inputField.frame = CGRectMake(20, 150, sw - 40, 44);
     [self.view addSubview:self.inputField];
 
-    CGFloat btnY = 215;
+    CGFloat btnY = 208;
     CGFloat btnW = (sw - 50) / 2.0;
 
     /* 3. 一键复制设备信息按钮 */
@@ -415,49 +504,75 @@ static CardAuthWindow *g_auth_window = nil;
     exitBtn.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1.0];
     [exitBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     exitBtn.layer.cornerRadius = 8;
-    exitBtn.frame = CGRectMake(20, 270, sw - 40, 40);
+    exitBtn.frame = CGRectMake(20, 263, sw - 40, 40);
     [exitBtn addTarget:self action:@selector(exitPressed:)
       forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:exitBtn];
 }
 
-/* 复制设备ID按钮 */
 - (void)copyDeviceID:(UIButton *)sender {
     NSString *devID = get_local_device_id();
     if (devID.length == 0) {
         [self showToast:@"无法获取设备ID"];
         return;
     }
-    /* 剪贴板操作必须主线程, 此处已在主线程 */
     [UIPasteboard generalPasteboard].string = devID;
-    [self showToast:@"设备ID已复制，可以发给开发者生成绑定卡密"];
+    [self showToast:@"设备ID已复制，发给开发者生成绑定卡密"];
 }
 
-/* 激活按钮 */
 - (void)activatePressed:(UIButton *)sender {
     NSString *card = self.inputField.text;
     if (card.length == 0) {
         [self showToast:@"请输入卡密"];
         return;
     }
-    /* 清理输入: 去除首尾空白、换行符、中间空格 */
+    /* 清理输入: 去空格换行 (支持用户 4+4+4+4 分组粘贴) */
     card = [card stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     card = [card stringByReplacingOccurrencesOfString:@" " withString:@""];
     card = [card stringByReplacingOccurrencesOfString:@"\n" withString:@""];
     card = [card stringByReplacingOccurrencesOfString:@"\r" withString:@""];
-    bool ok = [self parseAndValidateCard:card];
-    if (ok) {
-        g_is_activated = true;
-        [self dismissWindow];
+
+    char ctype = 0;
+    int64_t expire_ts = validate_card(card, &ctype);
+    if (expire_ts <= 0) {
+        NSLog(@"[card_auth] user input card invalid");
+        [self showToast:@"卡密无效"];
+        return;
     }
+
+    /* 本机黑名单 */
+    NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
+    if ([used containsObject:card]) {
+        [self showToast:@"卡密无效"];
+        return;
+    }
+
+    /* 所有校验通过 -> 写入 Keychain, 激活 */
+    kc_set_string(@(KC_ACTIVE_CARD), card);
+
+    NSMutableArray *new_used = [used mutableCopy];
+    [new_used addObject:card];
+    kc_set_array(@(KC_USED_CARD_LIST), new_used);
+
+    struct timeval boot = get_boottime();
+    int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+    NSDictionary *rec = @{
+        @"last_check_time": @(now),
+        @"last_boottime":   @((int64_t)boot.tv_sec)
+    };
+    NSData *rec_data = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
+    NSString *rec_json = [[NSString alloc] initWithData:rec_data
+                                                encoding:NSUTF8StringEncoding];
+    kc_set_string(@(KC_TIME_CHECK_REC), rec_json);
+
+    g_is_activated = true;
+    [self dismissWindow];
 }
 
-/* 退出按钮 */
 - (void)exitPressed:(UIButton *)sender {
     exit(0);
 }
 
-/* Toast 提示 */
 - (void)showToast:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
         UILabel *toast = [[UILabel alloc] init];
@@ -468,7 +583,7 @@ static CardAuthWindow *g_auth_window = nil;
         toast.textAlignment = NSTextAlignmentCenter;
         toast.numberOfLines = 0;
         toast.alpha = 0;
-        toast.frame = CGRectMake(20, 330, self.view.bounds.size.width - 40, 44);
+        toast.frame = CGRectMake(20, 323, self.view.bounds.size.width - 40, 44);
         toast.layer.cornerRadius = 8;
         toast.layer.masksToBounds = YES;
         [self.view addSubview:toast];
@@ -485,7 +600,6 @@ static CardAuthWindow *g_auth_window = nil;
     });
 }
 
-/* 错误弹窗 */
 - (void)showErrorAlert:(NSString *)title message:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
@@ -509,145 +623,10 @@ static CardAuthWindow *g_auth_window = nil;
     }];
 }
 
-/* =========================================================
- *  模块 D: 卡密解析解密 (用户提交卡密后)
- * ========================================================= */
-
-- (bool)parseAndValidateCard:(NSString *)card_str {
-    NSLog(@"[card_auth] parseAndValidateCard: input len=%lu", (unsigned long)card_str.length);
-    /* 1. 格式校验: 前缀:类型:密文
-     * 使用 ':' 做分隔符, 因为 Fernet base64url 编码不含 ':',
-     * 不会与密文内容冲突, 无需担心 split 问题 */
-    NSArray *parts = [card_str componentsSeparatedByString:@":"];
-    NSLog(@"[card_auth] split by ':' -> %lu parts", (unsigned long)parts.count);
-    if (parts.count < 3) {
-        NSLog(@"[card_auth] FAIL: parts < 3 (got %lu)", (unsigned long)parts.count);
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-    NSString *prefix = parts[0];
-    NSString *type   = parts[1];
-    /* 剩余部分用 ':' 重新拼接 (虽然正常情况下只有1段密文,
-     * 但保持兼容以防密文意外含 ':') */
-    NSMutableArray *cipherParts = [NSMutableArray arrayWithCapacity:parts.count - 2];
-    for (NSUInteger i = 2; i < parts.count; i++) {
-        [cipherParts addObject:parts[i]];
-    }
-    NSString *cipher = [cipherParts componentsJoinedByString:@":"];
-    NSLog(@"[card_auth] prefix=%@ type=%@ cipher_len=%lu", prefix, type, (unsigned long)cipher.length);
-
-    /* 前缀合法性 */
-    int64_t duration = 0;
-    bool prefix_valid = false;
-    for (int i = 0; i < g_duration_table_count; i++) {
-        if ([prefix isEqualToString:
-              [NSString stringWithUTF8String:g_duration_table[i].prefix]]) {
-            duration = g_duration_table[i].seconds;
-            prefix_valid = true;
-            break;
-        }
-    }
-    if (!prefix_valid) {
-        NSLog(@"[card_auth] FAIL: prefix '%@' invalid", prefix);
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-
-    /* 类型标识必须是 G 或 B */
-    bool is_bind = false;
-    if ([type isEqualToString:@"G"]) {
-        is_bind = false;
-    } else if ([type isEqualToString:@"B"]) {
-        is_bind = true;
-    } else {
-        NSLog(@"[card_auth] FAIL: type '%@' != G/B", type);
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-
-    /* 2. 黑名单查询: 完整卡密串是否已使用过 */
-    NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
-    if ([used containsObject:card_str]) {
-        NSLog(@"[card_auth] FAIL: card already used");
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-
-    /* 3. Fernet 解密 */
-    NSLog(@"[card_auth] calling fernet_decrypt...");
-    NSData *plain = fernet_decrypt(cipher);
-    if (!plain) {
-        NSLog(@"[card_auth] FAIL: fernet_decrypt nil");
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-    NSLog(@"[card_auth] decrypt OK, plain_len=%lu", (unsigned long)plain.length);
-
-    /* 解析明文: G→时间戳; B→时间戳||设备ID */
-    NSString *plain_str = [[NSString alloc] initWithData:plain
-                                                encoding:NSUTF8StringEncoding];
-    if (!plain_str) {
-        NSLog(@"[card_auth] FAIL: plain not valid UTF-8");
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-    NSLog(@"[card_auth] plain_str=%@", plain_str);
-
-    int64_t expire_ts = 0;
-
-    if (!is_bind) {
-        /* G 通用: 明文 = 到期时间戳 */
-        expire_ts = plain_str.longLongValue;
-    } else {
-        /* B 绑定: 明文 = 到期时间戳||设备ID */
-        NSArray *segs = [plain_str componentsSeparatedByString:@"||"];
-        if (segs.count != 2) {
-            [self showToast:@"卡密无效"];
-            return false;
-        }
-        expire_ts = [segs[0] longLongValue];
-        NSString *bind_device_id = segs[1];
-        /* 与本机对比 */
-        NSString *local_id = get_local_device_id();
-        if (![bind_device_id isEqualToString:local_id]) {
-            [self showToast:@"卡密无效"];
-            return false;
-        }
-    }
-
-    /* 4. 时间合法性: expire_ts 应 > 当前时间 */
-    int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
-    NSLog(@"[card_auth] expire=%lld now=%lld valid=%d", expire_ts, now, (int)(expire_ts > now));
-    if (expire_ts <= now) {
-        [self showToast:@"卡密无效"];
-        return false;
-    }
-
-    /* 5. 全部校验通过: 写入 Keychain */
-    kc_set_string(@(KC_EXPIRE_CIPHER), cipher);
-
-    NSMutableArray *new_used = [used mutableCopy];
-    [new_used addObject:card_str];
-    kc_set_array(@(KC_USED_CARD_LIST), new_used);
-
-    struct timeval boot = get_boottime();
-    NSDictionary *rec = @{
-        @"last_check_time": @(now),
-        @"last_boottime":   @((int64_t)boot.tv_sec)
-    };
-    NSData *rec_data = [NSJSONSerialization dataWithJSONObject:rec
-                                                        options:0 error:nil];
-    NSString *rec_json = [[NSString alloc] initWithData:rec_data
-                                                encoding:NSUTF8StringEncoding];
-    kc_set_string(@(KC_TIME_CHECK_REC), rec_json);
-
-    return true;
-}
-
 @end
 
 /* =========================================================
- *  弹窗辅助函数: 统一调用入口 (C 上下文)
+ *  弹窗辅助函数
  * ========================================================= */
 
 static void show_auth_window_on_main(void) {
@@ -664,29 +643,27 @@ static void show_auth_window_on_main(void) {
         /* 启动时自动读取剪贴板内容, 如果像卡密就填入输入框 */
         NSString *pasteboard = [UIPasteboard generalPasteboard].string;
         if (pasteboard && pasteboard.length > 0) {
-            /* 清理: 去除首尾空白、换行符、中间空格 */
             NSString *clean = [pasteboard
                 stringByTrimmingCharactersInSet:
                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
             clean = [clean stringByReplacingOccurrencesOfString:@" " withString:@""];
             clean = [clean stringByReplacingOccurrencesOfString:@"\n" withString:@""];
             clean = [clean stringByReplacingOccurrencesOfString:@"\r" withString:@""];
-            /* 简单检查: 卡密格式 前缀:类型:密文, 至少包含两个 ':' */
-            NSArray *testParts = [clean componentsSeparatedByString:@":"];
-            if (testParts.count >= 3) {
-                /* 看起来像卡密, 填入输入框 */
-                g_auth_window.inputField.text = clean;
-                [g_auth_window showToast:@"检测到剪贴板中有卡密，已自动填入"];
+            if (clean.length == 16) {
+                bool all_ok = true;
+                const char *s = clean.UTF8String;
+                for (int i = 0; i < 16; i++) {
+                    if (b62_char_ord(s[i]) < 0) { all_ok = false; break; }
+                }
+                if (all_ok) {
+                    g_auth_window.inputField.text = clean;
+                    [g_auth_window showToast:@"检测到剪贴板卡密，已自动填入"];
+                }
             }
         }
     });
 }
 
-/*
- * 错误场景弹窗, 用于 constructor/check_authorization 中无法通过
- * CardAuthWindow 实例调用的场景。
- * 对于"解密失败/过期/时间篡改"等不可恢复场景, 弹窗后退出进程。
- */
 static void show_fatal_alert_on_main(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
@@ -711,37 +688,25 @@ static void show_fatal_alert_on_main(NSString *title, NSString *msg) {
  * ========================================================= */
 
 static void check_authorization(void) {
-    /* 1. 读取 Keychain 全部授权数据 */
-    NSString *expire_cipher = kc_get_string(@(KC_EXPIRE_CIPHER));
-    if (!expire_cipher || expire_cipher.length == 0) {
-        /* 无授权 → 未激活, 唤起弹窗 */
+    /* 1. 读 Keychain: 当前激活卡密 */
+    NSString *active_card = kc_get_string(@(KC_ACTIVE_CARD));
+    if (!active_card || active_card.length == 0) {
         g_is_activated = false;
         show_auth_window_on_main();
         return;
     }
 
-    /* 2. 存在授权: 解密拿到到期时间戳 */
-    NSData *plain = fernet_decrypt(expire_cipher);
-    if (!plain) {
+    /* 2. 重新校验卡密有效性 (解出到期时间) */
+    char ctype = 0;
+    int64_t expire_ts = validate_card(active_card, &ctype);
+    if (expire_ts <= 0) {
         g_is_activated = false;
-        show_fatal_alert_on_main(@"授权数据损坏",
-                                  @"本地授权数据无法解密, 请重新激活");
+        show_fatal_alert_on_main(@"授权数据无效",
+                                  @"本地授权数据无法验证, 请重新激活");
         return;
     }
 
-    NSString *plain_str = [[NSString alloc] initWithData:plain
-                                                encoding:NSUTF8StringEncoding];
-    if (!plain_str) {
-        g_is_activated = false;
-        show_auth_window_on_main();
-        return;
-    }
-
-    /* 明文可能是 G(纯时间戳) 或 B(时间戳||设备ID), 取第一段 */
-    NSArray *segs = [plain_str componentsSeparatedByString:@"||"];
-    int64_t expire_ts = [segs[0] longLongValue];
-
-    /* 3. 获取当前系统时间、当前 boottime */
+    /* 3. 获取当前系统时间、boottime */
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
     struct timeval boot = get_boottime();
     int64_t boot_sec = (int64_t)boot.tv_sec;
@@ -761,12 +726,6 @@ static void check_authorization(void) {
     }
 
     /* 5. 时间篡改检测 */
-    /*
-     * 原理: 正常情况下 (now - last_check_time) 应与
-     *       (boot_sec - last_boottime) 接近。
-     *       如果用户把系统时间往前调, now 变大但 boottime 不变,
-     *       差值会显著增大 → 判定篡改。
-     */
     if (last_check_time > 0 && last_boottime > 0) {
         int64_t wall_delta = now - last_check_time;
         int64_t boot_delta = boot_sec - last_boottime;
@@ -780,10 +739,9 @@ static void check_authorization(void) {
         }
     }
 
-    /* 6. 当前时间 > 到期时间戳 → 过期失效 */
+    /* 6. 过期检测 */
     if (now > expire_ts) {
         g_is_activated = false;
-        /* 过期失效: 弹窗告知后 exit(0) (硬性约束: 过期场景调用 exit) */
         show_fatal_alert_on_main(@"已过期",
                                   @"卡密已超过有效期, 授权已失效");
         return;
@@ -810,29 +768,15 @@ static void check_authorization(void) {
 
 static void (*orig_sendEvent)(id, SEL, UIEvent *) = NULL;
 
-/* Hook 实现: 未激活时丢弃 App 触摸事件, 但放行弹窗及键盘的触摸 */
 static void hook_sendEvent(id self, SEL _cmd, UIEvent *event) {
     if (!g_is_activated) {
-        /* 未激活: 弹窗存在时放行所有触摸
-         *
-         * 原因: 弹窗是 keyWindow 且 windowLevel 最高, 覆盖在最上层。
-         * 用户实际能碰到的只有弹窗自身和系统键盘。
-         * 弹窗下方的 App 内容被完全遮挡, 无法被触摸到。
-         * 键盘是系统级 UITextEffectWindow, 也需要接收触摸才能输入。
-         * 所以只要弹窗在, 放行全部触摸是安全的。
-         * 弹窗关闭后 (g_auth_window == nil), 恢复拦截。 */
         if (g_auth_window) {
-            if (orig_sendEvent) {
-                orig_sendEvent(self, _cmd, event);
-            }
+            if (orig_sendEvent) orig_sendEvent(self, _cmd, event);
             return;
         }
-        /* 弹窗不存在, 丢弃所有触摸 */
-        return;
+        return; /* 丢弃 */
     }
-    if (orig_sendEvent) {
-        orig_sendEvent(self, _cmd, event);
-    }
+    if (orig_sendEvent) orig_sendEvent(self, _cmd, event);
 }
 
 static void install_sendEvent_hook(void) {
@@ -850,15 +794,8 @@ static void install_sendEvent_hook(void) {
 
 __attribute__((constructor(101)))
 static void card_auth_init(void) {
-    /* 1. dylib 加载, constructor(101) 最先执行 */
     g_is_activated = false;
-
-    /* 2. Hook sendEvent: 注册触摸拦截 (pre-main 优先完成) */
     install_sendEvent_hook();
-
-    /* 3. 主线程派发任务: 获取设备ID + 执行授权校验
-     *    禁止 constructor 内部直接调用 UIKit 弹窗,
-     *    必须等 runloop 启动后再弹窗 */
     dispatch_async(dispatch_get_main_queue(), ^{
         get_local_device_id();
         check_authorization();
@@ -866,16 +803,13 @@ static void card_auth_init(void) {
 }
 
 /*
- * 失败场景调用 exit(0) 结束进程 (硬性约束 #7):
- *   check_authorization (App 启动时):
- *     - 授权数据损坏 (解密失败) → show_fatal_alert → exit(0)
- *     - 已过期 → show_fatal_alert → exit(0)
- *     - 时间篡改 → show_fatal_alert → exit(0)
+ * 失败场景调用 exit(0):
+ *   check_authorization:
+ *     - 本地授权数据无法验证 -> 致命弹窗 -> exit
+ *     - 已过期               -> 致命弹窗 -> exit
+ *     - 时间篡改             -> 致命弹窗 -> exit
  *   用户交互:
- *     - 点击退出按钮 → exit(0)
+ *     - 点击退出按钮         -> exit
  *
- *   parseAndValidateCard (用户提交卡密时) 的失败场景:
- *     - 格式错误 / 黑名单 / 解密失败 / 设备不匹配 / 已过期
- *     → 弹窗告知用户, 返回 false, 允许重新输入正确卡密
- *     (不直接 exit, 因为用户可能只是输错了)
+ *   parseAndValidateCard (用户输入时失败): 只 toast, 允许重新输入
  */
