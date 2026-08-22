@@ -463,15 +463,23 @@ static CardAuthWindow *g_auth_window = nil;
  * ========================================================= */
 
 - (bool)parseAndValidateCard:(NSString *)card_str {
-    /* 1. 格式校验: 必须两段分隔符 '-', 区分 G/B 类型 */
+    /* 1. 格式校验: 前缀-类型-密文
+     * 注意: Fernet base64url 密文本身包含 '-' 字符,
+     * 所以只能用前两个 '-' 分隔 prefix 和 type,
+     * 剩余部分重新拼接为完整密文 */
     NSArray *parts = [card_str componentsSeparatedByString:@"-"];
-    if (parts.count != 3) {
+    if (parts.count < 3) {
         [self showToast:@"卡密无效"];
         return false;
     }
     NSString *prefix = parts[0];
     NSString *type   = parts[1];
-    NSString *cipher = parts[2];
+    /* 剩余部分用 '-' 重新拼接, 还原完整 Fernet 密文 */
+    NSMutableArray *cipherParts = [NSMutableArray arrayWithCapacity:parts.count - 2];
+    for (NSUInteger i = 2; i < parts.count; i++) {
+        [cipherParts addObject:parts[i]];
+    }
+    NSString *cipher = [cipherParts componentsJoinedByString:@"-"];
 
     /* 前缀合法性 */
     int64_t duration = 0;
