@@ -15,14 +15,14 @@ on:
       - main
       - master
     paths:
-      - 'card_auth.c'
+      - 'card_auth.m'
       - '.github/workflows/build-dylib.yml'
   pull_request:
     branches:
       - main
       - master
     paths:
-      - 'card_auth.c'
+      - 'card_auth.m'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
@@ -49,7 +49,7 @@ jobs:
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "Using SDK: $SDK_PATH"
 
-          # 编译 dylib
+          # 编译 dylib (必须是 .m 文件, Objective-C 源码)
           clang \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
@@ -65,7 +65,7 @@ jobs:
             -Wno-deprecated-declarations \
             -Wno-unused-function \
             -Wno-unused-variable \
-            card_auth.c \
+            card_auth.m \
             -o card_auth.dylib
 
           echo "=== 编译完成 ==="
