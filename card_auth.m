@@ -302,25 +302,40 @@ static uint32_t derive_20bit_tail(const char *prefix2,
     return v >> 4;
 }
 
+/* 校验返回原因码 (UI 用它区分"无效"/"过期"/"位数不够") */
+enum {
+    CAR_OK          = 0,
+    CAR_ERR_GENERIC = 1,
+    CAR_ERR_EXPIRED = 2,
+};
+
 /*
- * 验证一张卡密, 若成功返回到期时间戳 (>0), 失败返回 0.
- * 若返回 >0, *out_type 会被赋值为 'G' 或 'B'.
+ * 完整版校验: 返回 true 表示通过.
+ *   expire_out: 成功时赋值到期 Unix 时间戳 (秒)
+ *   type_out  : 成功时赋值为 'G' 或 'B' (可传 NULL)
+ *   reason_out: 失败时赋值为 CAR_ERR_* (可传 NULL)
  */
-static int64_t validate_card(NSString *card_str, char *out_type) {
-    if (out_type) *out_type = 0;
+static bool validate_card_ex(NSString *card_str,
+                              int64_t *expire_out,
+                              char *type_out,
+                              int *reason_out) {
+    if (expire_out) *expire_out = 0;
+    if (type_out)   *type_out   = 0;
+    if (reason_out) *reason_out = CAR_ERR_GENERIC;
+
     if (!card_str || card_str.length != 16) {
         NSLog(@"[card_auth] invalid card length (expect 16)");
-        return 0;
+        return false;
     }
     const char *cstr = card_str.UTF8String;
-    if (!cstr) return 0;
-    if (strlen(cstr) != 16) return 0;
+    if (!cstr) return false;
+    if (strlen(cstr) != 16) return false;
 
     /* 1. 校验所有字符都是合法 base62 */
     for (int i = 0; i < 16; i++) {
         if (b62_char_ord(cstr[i]) < 0) {
             NSLog(@"[card_auth] invalid char at pos %d: '%c'", i, cstr[i]);
-            return 0;
+            return false;
         }
     }
 
@@ -334,7 +349,7 @@ static int64_t validate_card(NSString *card_str, char *out_type) {
     int64_t dur = lookup_duration(prefix2);
     if (dur <= 0) {
         NSLog(@"[card_auth] unknown prefix: %.2s", prefix2);
-        return 0;
+        return false;
     }
 
     /* 4. CRC16 公开校验 */
@@ -344,21 +359,21 @@ static int64_t validate_card(NSString *card_str, char *out_type) {
     uint16_t expected_crc = crc16_xmodem(crc_src_buf, sizeof(crc_src_buf));
 
     uint64_t crc_18 = 0;
-    if (!b62_decode(crc3, 3, &crc_18)) return 0;
+    if (!b62_decode(crc3, 3, &crc_18)) return false;
     uint16_t restored = (uint16_t)((uint32_t)crc_18 & 0xFFFFu) ^
                         (uint16_t)(CRC_OBFUSCATOR & 0xFFFFu);
     if (restored != expected_crc) {
         NSLog(@"[card_auth] crc mismatch: expected %04X, got %04X",
               expected_crc, restored);
-        return 0;
+        return false;
     }
 
     /* 5. 解载荷 7字符 -> 32bit 整数 (4字节) */
     uint64_t cipher_int = 0;
-    if (!b62_decode(cipher7, 7, &cipher_int)) return 0;
+    if (!b62_decode(cipher7, 7, &cipher_int)) return false;
     if (cipher_int >= 0x100000000ULL) {
         NSLog(@"[card_auth] cipher_int overflow 32bit");
-        return 0;
+        return false;
     }
     uint8_t cipher_bytes[4];
     cipher_bytes[0] = (uint8_t)((cipher_int >> 24) & 0xFFu);
@@ -368,8 +383,8 @@ static int64_t validate_card(NSString *card_str, char *out_type) {
 
     /* 6. 解尾码 4字符 -> 20bit */
     uint64_t actual_tail = 0;
-    if (!b62_decode(tail4, 4, &actual_tail)) return 0;
-    if (actual_tail > 1048575ULL) return 0; /* 20bit 上限 */
+    if (!b62_decode(tail4, 4, &actual_tail)) return false;
+    if (actual_tail > 1048575ULL) return false; /* 20bit 上限 */
 
     /* 7. 优先尝试 B (绑定, 如果本地有 device_id), 再尝试 G (通用).
      *    两种类型独立派生 XOR 密钥流和尾码, 互不干扰. */
@@ -405,18 +420,28 @@ static int64_t validate_card(NSString *card_str, char *out_type) {
 
     if (match_type == 0) {
         NSLog(@"[card_auth] tail mismatch (wrong key/type/device)");
-        return 0;
+        return false;
     }
 
-    /* 8. 有效期检查: 过期卡密视为无效 (哪怕格式正确) */
+    /* 8. 有效期检查: 过期单独返回原因码, UI 提示"使用期限已到" */
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
     if (expire_ts <= now) {
         NSLog(@"[card_auth] card already expired at %lld (now=%lld)", expire_ts, now);
-        return 0;
+        if (reason_out) *reason_out = CAR_ERR_EXPIRED;
+        return false;
     }
 
-    if (out_type) *out_type = match_type;
-    return expire_ts;
+    if (expire_out) *expire_out = expire_ts;
+    if (type_out)   *type_out   = match_type;
+    if (reason_out) *reason_out = CAR_OK;
+    return true;
+}
+
+/* 兼容旧签名: 成功返回到期时间戳, 失败返回 0. (启动校验路径复用) */
+static int64_t validate_card(NSString *card_str, char *out_type) {
+    int64_t ts = 0;
+    validate_card_ex(card_str, &ts, out_type, NULL);
+    return ts;
 }
 
 /* =========================================================
@@ -577,7 +602,7 @@ static CardAuthWindow *g_auth_window = nil;
     if (!ok) {
         NSLog(@"[card_auth] user input card invalid (reason=%d)", car);
         if (car == CAR_ERR_EXPIRED) {
-            [self showToast:@"使用期限已到，请联系客服更换"];
+            [self showToast:@"使用期限已到，请联系客服换一个"];
         } else if (card.length < 16) {
             [self showToast:@"激活码位数不够"];
         } else {
