@@ -592,6 +592,18 @@ static void show_auth_window_on_main(void) {
         g_auth_window.window = win;
         win.hidden = NO;
         [win makeKeyAndVisible];
+
+        /* 启动时自动读取剪贴板内容, 如果像卡密就填入输入框 */
+        NSString *pasteboard = [UIPasteboard generalPasteboard].string;
+        if (pasteboard && pasteboard.length > 0) {
+            /* 简单检查: 卡密格式 前缀-类型-密文, 至少包含一个 '-' */
+            NSArray *testParts = [pasteboard componentsSeparatedByString:@"-"];
+            if (testParts.count >= 3) {
+                /* 看起来像卡密, 填入输入框 */
+                g_auth_window.inputField.text = pasteboard;
+                [g_auth_window showToast:@"检测到剪贴板中有卡密，已自动填入"];
+            }
+        }
     });
 }
 
@@ -723,24 +735,24 @@ static void check_authorization(void) {
 
 static void (*orig_sendEvent)(id, SEL, UIEvent *) = NULL;
 
-/* Hook 实现: 未激活时丢弃 App 触摸事件, 但放行弹窗自身的触摸 */
+/* Hook 实现: 未激活时丢弃 App 触摸事件, 但放行弹窗及键盘的触摸 */
 static void hook_sendEvent(id self, SEL _cmd, UIEvent *event) {
     if (!g_is_activated) {
-        /* 未激活: 检查触摸是否落在弹窗 window 上
-         * 如果是弹窗自身的触摸 (输入框/按钮), 放行;
-         * 否则丢弃, 防止用户操作 App 功能 */
-        if (g_auth_window && g_auth_window.window) {
-            /* 遍历事件中的所有触摸, 检查是否有落在弹窗 window 上的 */
-            NSSet *touches = [event touchesForWindow:g_auth_window.window];
-            if (touches && touches.count > 0) {
-                /* 弹窗自身的触摸, 放行 */
-                if (orig_sendEvent) {
-                    orig_sendEvent(self, _cmd, event);
-                }
-                return;
+        /* 未激活: 弹窗存在时放行所有触摸
+         *
+         * 原因: 弹窗是 keyWindow 且 windowLevel 最高, 覆盖在最上层。
+         * 用户实际能碰到的只有弹窗自身和系统键盘。
+         * 弹窗下方的 App 内容被完全遮挡, 无法被触摸到。
+         * 键盘是系统级 UITextEffectWindow, 也需要接收触摸才能输入。
+         * 所以只要弹窗在, 放行全部触摸是安全的。
+         * 弹窗关闭后 (g_auth_window == nil), 恢复拦截。 */
+        if (g_auth_window) {
+            if (orig_sendEvent) {
+                orig_sendEvent(self, _cmd, event);
             }
+            return;
         }
-        /* 非弹窗触摸, 丢弃 */
+        /* 弹窗不存在, 丢弃所有触摸 */
         return;
     }
     if (orig_sendEvent) {
