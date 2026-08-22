@@ -704,18 +704,10 @@ static void show_auth_window_on_main(void) {
     });
 }
 
-/* 双参数(逗号)兼容形式, 调用处写法: show_fatal_alert_on_main(@"a", @"b")
- * 注意: Objective-C 中调用者使用 func(@"a", @"b") 形式 (圆括号,逗号分隔),
- *       这种普通 C 函数调用与当前 show_fatal_alert_on_main 的参数列表天然匹配,
- *       保留 wrapper 仅做未来签名变更时向下兼容. */
-static void show_fatal_alert_on_main_compat(NSString *title, NSString *msg) {
-    show_fatal_alert_on_main(title, msg);
-}
-
 static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        /* 致命场景: 先清掉旧授权, 弹出激活窗口并在顶部提示.
-         * 注意: 此处绝对不能调用 exit(0), 也不能弹 UIAlert(点退出闪退).
+        /* 致命场景: 先清掉旧激活记录, 弹出激活窗口并在顶部提示.
+         * 注意: 此处绝对不能调用 exit(0), 也不能弹 UIAlert(易闪退).
          *       正确做法是把用户留在激活窗口, g_is_activated 保持 false,
          *       sendEvent 会继续拦截触摸, 用户无法进入主界面. */
         kc_set_string(@(KC_ACTIVE_CARD), @"");
@@ -731,7 +723,7 @@ static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
             [win makeKeyAndVisible];
         }
         /* 在激活窗口顶部显示原因 */
-        [g_auth_window showStickyInfo:title detail:msg];
+        [g_auth_window showStickyInfo:title detail:detail];
     });
 }
 
@@ -754,8 +746,7 @@ static void check_authorization(void) {
     int64_t expire_ts = validate_card(active_card, &ctype);
     if (expire_ts <= 0) {
         g_is_activated = false;
-        show_fatal_alert_on_main(@"激活失效"
-                                  detail:@"请重新输入激活码");
+        show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
         return;
     }
 
@@ -786,8 +777,7 @@ static void check_authorization(void) {
         if (diff < 0) diff = -diff;
         if (diff > TIME_TAMPER_THRESHOLD) {
             g_is_activated = false;
-            show_fatal_alert_on_main(@"系统时间异常"
-                                      detail:@"请确认手机时间正确后重试");
+            show_fatal_alert_on_main(@"系统时间异常", @"请确认手机时间正确后重试");
             return;
         }
     }
@@ -795,8 +785,7 @@ static void check_authorization(void) {
     /* 6. 过期检测 */
     if (now > expire_ts) {
         g_is_activated = false;
-        show_fatal_alert_on_main(@"使用期限已到"
-                                  detail:@"请联系客服获取新的激活码");
+        show_fatal_alert_on_main(@"使用期限已到", @"请联系客服获取新的激活码");
         return;
     }
 
