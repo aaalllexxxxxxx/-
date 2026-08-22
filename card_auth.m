@@ -208,7 +208,14 @@ static NSData *base64url_decode(NSString *b64) {
     if (r > 0) {
         [s appendString:[@"====" substringToIndex:(4 - r)]];
     }
-    NSData *decoded = [[NSData alloc] initWithBase64EncodedString:s options:0];
+    /* NSDataBase64DecodingIgnoreUnknownCharacters 忽略字符串中
+     * 非法字符 (如换行、空格), 更鲁棒 */
+    NSData *decoded = [[NSData alloc] initWithBase64EncodedString:s
+              options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    if (!decoded) {
+        NSLog(@"[card_auth] base64 decode failed, input len=%lu, first 20 chars: %@",
+              (unsigned long)s.length, [s substringToIndex:MIN(20, s.length)]);
+    }
     return decoded;
 }
 
@@ -247,16 +254,31 @@ static NSData *pkcs7_unpad(NSData *data) {
 
 /* AES-128-CBC 解密 (key=16 bytes, iv=16 bytes) */
 static NSData *aes128_cbc_decrypt(NSData *cipher, NSData *key, NSData *iv) {
-    if (cipher.length == 0 || cipher.length % 16 != 0) return nil;
-    if (key.length != 16 || iv.length != 16) return nil;
+    if (cipher.length == 0 || cipher.length % 16 != 0) {
+        NSLog(@"[card_auth] aes: bad cipher len=%lu", (unsigned long)cipher.length);
+        return nil;
+    }
+    if (key.length != 16 || iv.length != 16) {
+        NSLog(@"[card_auth] aes: bad key/iv len key=%lu iv=%lu",
+              (unsigned long)key.length, (unsigned long)iv.length);
+        return nil;
+    }
     NSMutableData *out = [NSMutableData dataWithLength:cipher.length];
+    size_t out_moved = 0;
     CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0,
                                   key.bytes, kCCKeySizeAES128,
                                   iv.bytes,
                                   cipher.bytes, cipher.length,
-                                  out.mutableBytes, out.length, NULL);
+                                  out.mutableBytes, out.length, &out_moved);
+    NSLog(@"[card_auth] aes: CCCrypt status=%d, out_moved=%zu, cipher_len=%lu",
+          st, out_moved, (unsigned long)cipher.length);
     if (st != kCCSuccess) return nil;
-    return pkcs7_unpad(out);
+    NSData *unpadded = pkcs7_unpad(out);
+    if (!unpadded) {
+        NSLog(@"[card_auth] aes: pkcs7_unpad nil, out_len=%lu, last_byte=0x%02x",
+              (unsigned long)out.length, ((const uint8_t *)out.bytes)[out.length - 1]);
+    }
+    return unpadded;
 }
 
 /*
@@ -269,24 +291,43 @@ static NSData *aes128_cbc_decrypt(NSData *cipher, NSData *key, NSData *iv) {
  *   token = base64url(0x80 + timestamp(8B) + IV(16B) + ciphertext + HMAC(32B))
  */
 static NSData *fernet_decrypt(NSString *token_str) {
-    if (!token_str || token_str.length == 0) return nil;
+    if (!token_str || token_str.length == 0) {
+        NSLog(@"[card_auth] fernet_decrypt: nil/empty input");
+        return nil;
+    }
 
     NSData *raw = base64url_decode(token_str);
-    if (!raw || raw.length < 33) return nil; /* ver(1)+ts(8)+iv(16)+ct(>=16)+hmac(32) */
+    if (!raw) {
+        NSLog(@"[card_auth] fernet_decrypt: base64url_decode nil");
+        return nil;
+    }
+    if (raw.length < 33) {
+        NSLog(@"[card_auth] fernet_decrypt: raw too short (%lu < 33)", (unsigned long)raw.length);
+        return nil;
+    }
 
     const uint8_t *ptr = raw.bytes;
-    if (ptr[0] != 0x80) return nil; /* version check */
+    if (ptr[0] != 0x80) {
+        NSLog(@"[card_auth] fernet_decrypt: version 0x%02x != 0x80", ptr[0]);
+        return nil;
+    }
 
     /* IV at offset 9, length 16 */
     NSData *iv = [NSData dataWithBytes:(ptr + 9) length:16];
     /* Ciphertext at offset 25, to end minus last 32 HMAC bytes */
     size_t ct_len = raw.length - 25 - 32;
-    if (ct_len == 0 || (ct_len % 16 != 0)) return nil;
+    if (ct_len == 0 || (ct_len % 16 != 0)) {
+        NSLog(@"[card_auth] fernet_decrypt: ct_len=%zu, raw_len=%lu", ct_len, (unsigned long)raw.length);
+        return nil;
+    }
     NSData *ct = [NSData dataWithBytes:(ptr + 25) length:ct_len];
 
     /* encryption_key = g_fernet_key[16:32] (后16字节, AES-128) */
     NSData *enc_key = [NSData dataWithBytes:(g_fernet_key + 16) length:16];
     NSData *plain = aes128_cbc_decrypt(ct, enc_key, iv);
+    if (!plain) {
+        NSLog(@"[card_auth] fernet_decrypt: aes128_cbc_decrypt nil, ct_len=%zu", ct_len);
+    }
     return plain;
 }
 
@@ -329,8 +370,12 @@ static CardAuthWindow *g_auth_window = nil;
     self.inputField = [[UITextField alloc] init];
     self.inputField.placeholder = @"输入卡密";
     self.inputField.borderStyle = UITextBorderStyleRoundedRect;
-    self.inputField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    /* 卡密是 base64url 编码, 大小写敏感, 必须禁用自动大写和自动纠错 */
+    self.inputField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     self.inputField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.inputField.spellCheckingType = UITextSpellCheckingTypeNo;
+    self.inputField.smartQuotesType = UITextSmartQuotesTypeNo;
+    self.inputField.smartDashesType = UITextSmartDashesTypeNo;
     self.inputField.delegate = self;
     self.inputField.frame = CGRectMake(20, 155, sw - 40, 44);
     [self.view addSubview:self.inputField];
@@ -394,6 +439,11 @@ static CardAuthWindow *g_auth_window = nil;
         [self showToast:@"请输入卡密"];
         return;
     }
+    /* 清理输入: 去除首尾空白、换行符、中间空格 */
+    card = [card stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    card = [card stringByReplacingOccurrencesOfString:@" " withString:@""];
+    card = [card stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+    card = [card stringByReplacingOccurrencesOfString:@"\r" withString:@""];
     bool ok = [self parseAndValidateCard:card];
     if (ok) {
         g_is_activated = true;
@@ -463,11 +513,13 @@ static CardAuthWindow *g_auth_window = nil;
  * ========================================================= */
 
 - (bool)parseAndValidateCard:(NSString *)card_str {
+    NSLog(@"[card_auth] parseAndValidateCard: input len=%lu", (unsigned long)card_str.length);
     /* 1. 格式校验: 前缀-类型-密文
      * 注意: Fernet base64url 密文本身包含 '-' 字符,
      * 所以只能用前两个 '-' 分隔 prefix 和 type,
      * 剩余部分重新拼接为完整密文 */
     NSArray *parts = [card_str componentsSeparatedByString:@"-"];
+    NSLog(@"[card_auth] split -> %lu parts", (unsigned long)parts.count);
     if (parts.count < 3) {
         [self showToast:@"卡密无效"];
         return false;
@@ -480,6 +532,7 @@ static CardAuthWindow *g_auth_window = nil;
         [cipherParts addObject:parts[i]];
     }
     NSString *cipher = [cipherParts componentsJoinedByString:@"-"];
+    NSLog(@"[card_auth] prefix=%@ type=%@ cipher_len=%lu", prefix, type, (unsigned long)cipher.length);
 
     /* 前缀合法性 */
     int64_t duration = 0;
@@ -493,6 +546,7 @@ static CardAuthWindow *g_auth_window = nil;
         }
     }
     if (!prefix_valid) {
+        NSLog(@"[card_auth] FAIL: prefix '%@' invalid", prefix);
         [self showToast:@"卡密无效"];
         return false;
     }
@@ -504,6 +558,7 @@ static CardAuthWindow *g_auth_window = nil;
     } else if ([type isEqualToString:@"B"]) {
         is_bind = true;
     } else {
+        NSLog(@"[card_auth] FAIL: type '%@' != G/B", type);
         [self showToast:@"卡密无效"];
         return false;
     }
@@ -511,24 +566,30 @@ static CardAuthWindow *g_auth_window = nil;
     /* 2. 黑名单查询: 完整卡密串是否已使用过 */
     NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
     if ([used containsObject:card_str]) {
+        NSLog(@"[card_auth] FAIL: card already used");
         [self showToast:@"卡密无效"];
         return false;
     }
 
     /* 3. Fernet 解密 */
+    NSLog(@"[card_auth] calling fernet_decrypt...");
     NSData *plain = fernet_decrypt(cipher);
     if (!plain) {
+        NSLog(@"[card_auth] FAIL: fernet_decrypt nil");
         [self showToast:@"卡密无效"];
         return false;
     }
+    NSLog(@"[card_auth] decrypt OK, plain_len=%lu", (unsigned long)plain.length);
 
     /* 解析明文: G→时间戳; B→时间戳||设备ID */
     NSString *plain_str = [[NSString alloc] initWithData:plain
                                                 encoding:NSUTF8StringEncoding];
     if (!plain_str) {
+        NSLog(@"[card_auth] FAIL: plain not valid UTF-8");
         [self showToast:@"卡密无效"];
         return false;
     }
+    NSLog(@"[card_auth] plain_str=%@", plain_str);
 
     int64_t expire_ts = 0;
 
@@ -554,6 +615,7 @@ static CardAuthWindow *g_auth_window = nil;
 
     /* 4. 时间合法性: expire_ts 应 > 当前时间 */
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+    NSLog(@"[card_auth] expire=%lld now=%lld valid=%d", expire_ts, now, (int)(expire_ts > now));
     if (expire_ts <= now) {
         [self showToast:@"卡密无效"];
         return false;
@@ -600,11 +662,18 @@ static void show_auth_window_on_main(void) {
         /* 启动时自动读取剪贴板内容, 如果像卡密就填入输入框 */
         NSString *pasteboard = [UIPasteboard generalPasteboard].string;
         if (pasteboard && pasteboard.length > 0) {
-            /* 简单检查: 卡密格式 前缀-类型-密文, 至少包含一个 '-' */
-            NSArray *testParts = [pasteboard componentsSeparatedByString:@"-"];
+            /* 清理: 去除首尾空白、换行符、中间空格 */
+            NSString *clean = [pasteboard
+                stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            clean = [clean stringByReplacingOccurrencesOfString:@" " withString:@""];
+            clean = [clean stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+            clean = [clean stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+            /* 简单检查: 卡密格式 前缀-类型-密文, 至少包含两个 '-' */
+            NSArray *testParts = [clean componentsSeparatedByString:@"-"];
             if (testParts.count >= 3) {
                 /* 看起来像卡密, 填入输入框 */
-                g_auth_window.inputField.text = pasteboard;
+                g_auth_window.inputField.text = clean;
                 [g_auth_window showToast:@"检测到剪贴板中有卡密，已自动填入"];
             }
         }
