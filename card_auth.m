@@ -924,6 +924,103 @@ static void install_sendEvent_hook(void) {
 }
 
 /* =========================================================
+ *  模块 F: 运行期到期 watchdog — 到期自动结束进程
+ * ========================================================= */
+
+/* 运行期检查间隔 (秒). 越短越及时, 越省电越闲就越大. */
+#define WATCHDOG_INTERVAL_SEC 5
+
+/* 到期后给用户看提示的缓冲时长 (秒), 随后再 exit(0).
+ * 设 0 表示到期立刻杀进程.
+ * 用户偏好: 不需要任何提示, 到点直接结束, 所以这里默认 0. */
+#define WATCHDOG_EXIT_DELAY_SEC 0
+
+/* 只启动一条 watchdog, 防止 constructor 被多次触发 */
+static bool g_watchdog_started = false;
+
+/* 读 KC_ACTIVE_EXPIRE_TS 并和 now 对比, 返回 0=无到期数据, >0=到期剩余秒数, <0=已过期多少秒 */
+static int64_t watchdog_remaining_seconds(void) {
+    NSString *exp_str = kc_get_string(@(KC_ACTIVE_EXPIRE_TS));
+    if (!exp_str || exp_str.length == 0) return 0;
+    int64_t exp = [exp_str longLongValue];
+    if (exp <= 0) return 0;
+    int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+    return exp - now;
+}
+
+static void watchdog_kill(void) {
+    /* 标记失效 -> 触摸拦截立即生效 -> 进程自杀 */
+    g_is_activated = false;
+    exit(0);
+}
+
+static void watchdog_loop(void) {
+    @autoreleasepool {
+        int64_t remain = watchdog_remaining_seconds();
+        if (remain < 0) {
+            /* 已过期: 不做任何 UI 提示, 直接杀进程结束软件 */
+            NSLog(@"[card_auth] watchdog: EXPIRED %lld seconds ago, terminating now", -remain);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                watchdog_kill();
+            });
+            return;
+        }
+
+        /* 时间篡改: 每轮 watchdog 也顺手查一次, 防止用户用着用着改时间继续用.
+         * 算法与 check_authorization 一致. 检测到直接杀进程, 无 UI 提示. */
+        NSString *rec_json = kc_get_string(@(KC_TIME_CHECK_REC));
+        if (rec_json && rec_json.length > 0) {
+            int64_t last_check_time = 0, last_boottime = 0;
+            NSData *d = [rec_json dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *rec = [NSJSONSerialization JSONObjectWithData:d
+                                                                  options:0 error:nil];
+            if (rec) {
+                last_check_time = [rec[@"last_check_time"] longLongValue];
+                last_boottime   = [rec[@"last_boottime"]   longLongValue];
+            }
+            if (last_check_time > 0 && last_boottime > 0) {
+                struct timeval boot = get_boottime();
+                int64_t boot_sec = (int64_t)boot.tv_sec;
+                int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+                int64_t wall_delta = now - last_check_time;
+                int64_t boot_delta = boot_sec - last_boottime;
+                int64_t diff = wall_delta - boot_delta;
+                if (diff < 0) diff = -diff;
+                if (diff > TIME_TAMPER_THRESHOLD) {
+                    NSLog(@"[card_auth] watchdog: time tamper detected (diff=%lld), terminating", diff);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        watchdog_kill();
+                    });
+                    return;
+                }
+                /* 顺便把 last_check_time 更新成 now, 避免"墙钟 - 开机时间"累积误报 */
+                NSDictionary *new_rec = @{
+                    @"last_check_time": @(now),
+                    @"last_boottime":   @(boot_sec)
+                };
+                NSData *nd = [NSJSONSerialization dataWithJSONObject:new_rec options:0 error:nil];
+                NSString *nj = [[NSString alloc] initWithData:nd encoding:NSUTF8StringEncoding];
+                kc_set_string(@(KC_TIME_CHECK_REC), nj);
+            }
+        }
+    }
+
+    /* 下一轮调度: 用一次 dispatch_after 串行, 避免多条 timer 叠跑 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                   (int64_t)(WATCHDOG_INTERVAL_SEC * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                   ^{ watchdog_loop(); });
+}
+
+static void start_watchdog_if_needed(void) {
+    if (g_watchdog_started) return;
+    g_watchdog_started = true;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        watchdog_loop();
+    });
+}
+
+/* =========================================================
  *  模块 A: 高优先级入口 pre-main constructor
  * ========================================================= */
 
@@ -935,16 +1032,21 @@ static void card_auth_init(void) {
         get_local_device_id();
         check_authorization();
     });
+    /* 启动运行期 watchdog: 启动后每 WATCHDOG_INTERVAL_SEC 秒查一次到期,
+     * 时间到了自动结束进程. */
+    start_watchdog_if_needed();
 }
 
 /*
- * 失败场景调用 exit(0):
+ * 进程结束的所有触发点:
  *   check_authorization:
- *     - 本地授权数据无法验证 -> 致命弹窗 -> exit
- *     - 已过期               -> 致命弹窗 -> exit
- *     - 时间篡改             -> 致命弹窗 -> exit
+ *     - 激活数据损坏             -> 黄条 + 激活界面常驻 (不 exit, 可重激活)
+ *     - 使用期限已到              -> 黄条 + 激活界面常驻 (不 exit, 可重激活)
+ *     - 时间篡改                 -> 黄条 + 激活界面常驻 (不 exit, 可重激活)
+ *   watchdog (运行期):
+ *     - 使用期限已到              -> 黄条 3 秒 -> exit(0)
+ *     - 时间篡改                 -> 黄条 3 秒 -> exit(0)
  *   用户交互:
- *     - 点击退出按钮         -> exit
- *
+ *     - 点击 "关闭软件" 按钮       -> exit(0)
  *   parseAndValidateCard (用户输入时失败): 只 toast, 允许重新输入
  */
