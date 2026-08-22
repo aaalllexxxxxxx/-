@@ -815,6 +815,11 @@ static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
  * ========================================================= */
 
 static void check_authorization(void) {
+    /* 局部宏: 所有退出路径统一收尾: 放行 watchdog 的第一次 tick, 然后 return.
+     * 用 do-while 宏而非 goto, 是因为该函数后面声明了 __strong 的 ObjC 对象
+     * (NSDictionary/NSData/NSString 等), Clang 禁止 goto 从前面的块跳过后者的初始化声明. */
+#define __FINISH_AND_RETURN() do { g_init_done = true; return; } while(0)
+
     /* 1. 读 Keychain: KC_ACTIVE_EXPIRE_TS = 激活成功时写入的真正到期时间戳 (字符串数字)
      *    KC_ACTIVE_CARD = 当时激活的 16 位激活码, 用作二次校验. */
     NSString *exp_str   = kc_get_string(@(KC_ACTIVE_EXPIRE_TS));
@@ -824,13 +829,13 @@ static void check_authorization(void) {
         (!active_cd || active_cd.length == 0)) {
         g_is_activated = false;
         show_auth_window_on_main();
-        goto __done;   /* 未激活路径: 依然要放行 watchdog (用户激活后 watchdog 要生效) */
+        __FINISH_AND_RETURN();
     }
     if (!exp_str || exp_str.length == 0) {
         /* 老数据 (v2 只写 KC_ACTIVE_CARD): 视为不完整, 强制重激活 */
         g_is_activated = false;
         show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
-        goto __done;
+        __FINISH_AND_RETURN();
     }
 
     /* 2. 解析到期时间戳 (主判定依据). longLongValue 解析失败返回 0, 会被下一个分支自然拦住 */
@@ -840,13 +845,10 @@ static void check_authorization(void) {
     if (stored_expire_ts <= 0 || now > stored_expire_ts) {
         g_is_activated = false;
         show_fatal_alert_on_main(@"使用期限已到", @"请联系客服获取新的激活码");
-        goto __done;
+        __FINISH_AND_RETURN();
     }
 
-    /* 3. 可选二次校验: 激活码原文 CRC+尾码 仍然合法 (不通过激活窗口判断, 只判断格式/密钥)
-     *    这里传 NULL 到 reason_out, 且仅用于格式级别的校验, 不再套用「激活窗口」
-     *    的过期判定 (因为 activation window 是针对"首次激活"的, 已经激活过的
-     *    KC_ACTIVE_CARD 肯定老早就超过窗口, 用窗口判断就错了). */
+    /* 3. 可选二次校验: 激活码原文 CRC+尾码 仍然合法 (不通过激活窗口判断, 只判断格式/密钥) */
     if (active_cd && active_cd.length == 16) {
         int car = CAR_OK;
         BOOL good = validate_card_ex(active_cd, NULL, NULL, NULL, NULL, &car);
@@ -854,7 +856,7 @@ static void check_authorization(void) {
             NSLog(@"[card_auth] saved active card corrupted (reason=%d)", car);
             g_is_activated = false;
             show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
-            goto __done;
+            __FINISH_AND_RETURN();
         }
     }
 
@@ -883,7 +885,7 @@ static void check_authorization(void) {
         if (diff > TIME_TAMPER_THRESHOLD) {
             g_is_activated = false;
             show_fatal_alert_on_main(@"系统时间异常", @"请确认手机时间正确后重试");
-            goto __done;
+            __FINISH_AND_RETURN();
         }
     }
 
@@ -901,14 +903,9 @@ static void check_authorization(void) {
                                                   encoding:NSUTF8StringEncoding];
     kc_set_string(@(KC_TIME_CHECK_REC), new_rec_json);
 
-__done:
-    /* 所有路径统一抵达: 放行 watchdog 第一次 tick.
-     *   放在这里有两个关键作用:
-     *     1) 启动期未完成时, 不会被 watchdog 抢先读取"上次到期未清"的 KC 然后 exit,
-     *        避免「双击就闪退 / 再也进不去」的死循环.
-     *     2) 任何 fatal 结束路径都保证 g_init_done=true, 之后用户成功重新激活,
-     *        watchdog 的运行期到期 / 篡改监测依然能照常工作. */
+    /* 正常退出路径也必须置 g_init_done=true, 否则 watchdog 永远不 tick. */
     g_init_done = true;
+#undef __FINISH_AND_RETURN
 }
 
 /* =========================================================
