@@ -466,8 +466,7 @@ static CardAuthWindow *g_auth_window = nil;
     /* 1. 格式校验: 必须两段分隔符 '-', 区分 G/B 类型 */
     NSArray *parts = [card_str componentsSeparatedByString:@"-"];
     if (parts.count != 3) {
-        [self showErrorAlert:@"格式错误"
-                       message:@"卡密格式不正确, 应为 前缀-类型-密文, 如 S30-G-xxx"];
+        [self showToast:@"卡密无效"];
         return false;
     }
     NSString *prefix = parts[0];
@@ -486,7 +485,7 @@ static CardAuthWindow *g_auth_window = nil;
         }
     }
     if (!prefix_valid) {
-        [self showErrorAlert:@"格式错误" message:@"未知卡密档位前缀"];
+        [self showToast:@"卡密无效"];
         return false;
     }
 
@@ -497,23 +496,21 @@ static CardAuthWindow *g_auth_window = nil;
     } else if ([type isEqualToString:@"B"]) {
         is_bind = true;
     } else {
-        [self showErrorAlert:@"格式错误" message:@"卡密类型标识必须为 G 或 B"];
+        [self showToast:@"卡密无效"];
         return false;
     }
 
     /* 2. 黑名单查询: 完整卡密串是否已使用过 */
     NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
     if ([used containsObject:card_str]) {
-        [self showErrorAlert:@"卡密已使用"
-                       message:@"该卡密已在本机使用过, 不可重复激活"];
+        [self showToast:@"卡密无效"];
         return false;
     }
 
     /* 3. Fernet 解密 */
     NSData *plain = fernet_decrypt(cipher);
     if (!plain) {
-        [self showErrorAlert:@"解密失败"
-                       message:@"卡密密文无法解密, 请检查卡密是否完整"];
+        [self showToast:@"卡密无效"];
         return false;
     }
 
@@ -521,7 +518,7 @@ static CardAuthWindow *g_auth_window = nil;
     NSString *plain_str = [[NSString alloc] initWithData:plain
                                                 encoding:NSUTF8StringEncoding];
     if (!plain_str) {
-        [self showErrorAlert:@"解密失败" message:@"解密内容格式错误"];
+        [self showToast:@"卡密无效"];
         return false;
     }
 
@@ -534,7 +531,7 @@ static CardAuthWindow *g_auth_window = nil;
         /* B 绑定: 明文 = 到期时间戳||设备ID */
         NSArray *segs = [plain_str componentsSeparatedByString:@"||"];
         if (segs.count != 2) {
-            [self showErrorAlert:@"解密失败" message:@"绑定卡密载荷格式错误"];
+            [self showToast:@"卡密无效"];
             return false;
         }
         expire_ts = [segs[0] longLongValue];
@@ -542,8 +539,7 @@ static CardAuthWindow *g_auth_window = nil;
         /* 与本机对比 */
         NSString *local_id = get_local_device_id();
         if (![bind_device_id isEqualToString:local_id]) {
-            [self showErrorAlert:@"设备不匹配"
-                           message:@"该卡密仅限其他设备使用, 本机不可激活"];
+            [self showToast:@"卡密无效"];
             return false;
         }
     }
@@ -551,7 +547,7 @@ static CardAuthWindow *g_auth_window = nil;
     /* 4. 时间合法性: expire_ts 应 > 当前时间 */
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
     if (expire_ts <= now) {
-        [self showErrorAlert:@"已过期" message:@"该卡密已超过有效期"];
+        [self showToast:@"卡密无效"];
         return false;
     }
 
