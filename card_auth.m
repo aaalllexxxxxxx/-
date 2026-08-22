@@ -3,14 +3,20 @@
  * Target: arm64-apple-ios
  * Dependencies: UIKit, Security.framework, Foundation, CommonCrypto
  * Constructor Priority: __attribute__((constructor(101)))
- */
- * 新版 16 位短卡密 (大小写字母 + 数字, 共 62 种字符, 不含分隔符):
+ *
+ * 新版 16 位短激活码 (大小写字母 + 数字, 共 62 种字符, 不含分隔符):
  *   [档位2位][载荷7位][校验3位][尾码4位]
  *     S3/M1/H1/H3/D1/W7/M3/M9/Y1/Y0 共 10 个档位
- *     载荷  : Base62( 32bit 到期Unix时间戳 XOR 密钥派生流 )
+ *     载荷  : Base62( 32bit 生成时间戳 XOR 密钥派生流 )  (v3 不再存到期时间戳)
  *     校验  : Base62( CRC16_XMODEM(档位+载荷) XOR 混淆常量 (低16位) + 高2位混淆 )
  *     尾码  : G=HMAC(KEY, "G:"+档位+载荷+校验)[0:20bit]
  *             B=HMAC(KEY, "B:"+设备ID+档位+载荷+校验)[0:20bit]
+ *
+ * v3 关键行为:
+ *   - 激活码生成后只保留 "激活窗口" (默认 24 小时): 超过窗口再输入 → UI 提示"使用期限已到"
+ *   - 真正的使用期 = 用户点击「立即激活」那一刻 + 档位秒数; 到期时间只存在设备本地 Keychain
+ *   - 运行期到期 / 时间篡改 → watchdog 每 5 秒检测一次, 无提示直接 exit(0)
+ *   - exit(0) 前会清空 ACTIVE_CARD / ACTIVE_EXPIRE_TS / TIME_CHECK_REC, 防止下次启动再闪退
  *
  * 编译: clang -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
  *       -framework UIKit -framework Security -framework Foundation \
