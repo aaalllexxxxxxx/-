@@ -60,9 +60,19 @@ static bool g_is_activated = false;
 /* ---- Keychain Service 标识 ---- */
 #define KC_SERVICE            "com.nbxy.app.cardauth"
 #define KC_ACTIVE_CARD        "active_card"          /* 当前激活的完整 16 位卡密 */
-#define KC_USED_CARD_LIST     "used_card_list"       /* 本机黑名单 */
+#define KC_ACTIVE_EXPIRE_TS   "active_expire_ts"     /* v3 新增: 真正的到期时间戳(激活成功时写入, 字符串数字) */
+#define KC_USED_CARD_LIST     "used_card_list"       /* 本机已使用激活码黑名单 */
 #define KC_TIME_CHECK_REC     "time_check_record"    /* 时间篡改记录 */
 #define KC_LOCAL_DEVICE_ID    "local_device_id"      /* 设备 ID 缓存 */
+
+/* ---- 运行时阈值 ----
+ * TIME_ACTIVATION_WINDOW_SEC: 一张激活码从生成时刻开始, 允许在多少秒内完成首次激活.
+ *                             超过这个窗口再输入, 激活界面就直接显示"使用期限已到".
+ *                             必须与 gen_card.py 的 DEFAULT_ACTIVATION_WINDOW 保持一致.
+ * TIME_TAMPER_THRESHOLD   : 墙上时间 - 开机时间 的漂移超过此阈值 (秒) 认为时间被调过, 默认 2 天.
+ */
+#define TIME_ACTIVATION_WINDOW_SEC  (24 * 3600)
+#define TIME_TAMPER_THRESHOLD       172800
 
 /* ---- 前缀 → 秒数映射 (新两位档位码) ---- */
 typedef struct {
@@ -85,8 +95,7 @@ static const duration_entry_t g_duration_table[] = {
 static const int g_duration_table_count =
     (int)(sizeof(g_duration_table) / sizeof(g_duration_table[0]));
 
-/* ---- 时间篡改阈值: 2 天 = 172800 秒 ---- */
-#define TIME_TAMPER_THRESHOLD 172800
+/* ---- 时间篡改阈值: 2 天 = 172800 秒. 已在上方集中定义, 此处保留占位便于查阅. ---- */
 
 /* =========================================================
  *  工具子模块
@@ -306,20 +315,34 @@ static uint32_t derive_20bit_tail(const char *prefix2,
 enum {
     CAR_OK          = 0,
     CAR_ERR_GENERIC = 1,
-    CAR_ERR_EXPIRED = 2,
+    CAR_ERR_EXPIRED = 2,   /* 已超激活窗口 (老激活码重新输入会触发) */
 };
 
 /*
- * 完整版校验: 返回 true 表示通过.
- *   expire_out: 成功时赋值到期 Unix 时间戳 (秒)
- *   type_out  : 成功时赋值为 'G' 或 'B' (可传 NULL)
- *   reason_out: 失败时赋值为 CAR_ERR_* (可传 NULL)
+ * validate_card_ex — v3 语义: 载荷内是「生成时间戳」不是到期时间戳.
+ *
+ * 一条新激活码要能被用于激活, 必须: 格式对 + CRC对 + 尾码匹配 +
+ * (now - gen_ts) <= TIME_ACTIVATION_WINDOW_SEC. 最后这一步失败
+ * 会被标记为 CAR_ERR_EXPIRED, UI 显示"使用期限已到".
+ *
+ * 输出参数:
+ *   expire_out  : v3 不再使用 (保留位, 始终赋 0)
+ *   gen_out     : 解密得到的 生成时间戳 (可 NULL)
+ *   dur_out     : 查表得到的 档位秒数 (可 NULL)
+ *   type_out    : 'G' / 'B' (可 NULL)
+ *   reason_out  : CAR_OK / CAR_ERR_* (可 NULL)
+ *
+ * 返回 true 表示「可用于激活」, false 表示拒绝.
  */
 static bool validate_card_ex(NSString *card_str,
-                              int64_t *expire_out,
-                              char *type_out,
-                              int *reason_out) {
+                              int64_t *expire_out,   /* 保留, 始终 0 */
+                              int64_t *gen_out,
+                              int64_t *dur_out,
+                              char    *type_out,
+                              int     *reason_out) {
     if (expire_out) *expire_out = 0;
+    if (gen_out)    *gen_out    = 0;
+    if (dur_out)    *dur_out    = 0;
     if (type_out)   *type_out   = 0;
     if (reason_out) *reason_out = CAR_ERR_GENERIC;
 
@@ -340,12 +363,12 @@ static bool validate_card_ex(NSString *card_str,
     }
 
     /* 2. 切片 */
-    const char *prefix2 = cstr;       /* [0,2) */
-    const char *cipher7 = cstr + 2;   /* [2,9) */
-    const char *crc3    = cstr + 9;   /* [9,12) */
-    const char *tail4   = cstr + 12;  /* [12,16) */
+    const char *prefix2 = cstr;       /* [0,2) 档位 2 位 */
+    const char *cipher7 = cstr + 2;   /* [2,9) 生成时间戳密文 */
+    const char *crc3    = cstr + 9;   /* [9,12) CRC */
+    const char *tail4   = cstr + 12;  /* [12,16) 尾码 */
 
-    /* 3. 查档位合法性 */
+    /* 3. 查档位合法性 + 得到档位秒数 dur */
     int64_t dur = lookup_duration(prefix2);
     if (dur <= 0) {
         NSLog(@"[card_auth] unknown prefix: %.2s", prefix2);
@@ -368,7 +391,7 @@ static bool validate_card_ex(NSString *card_str,
         return false;
     }
 
-    /* 5. 解载荷 7字符 -> 32bit 整数 (4字节) */
+    /* 5. 解载荷 7 字符 -> 32bit 生成时间戳 (XOR 密文) */
     uint64_t cipher_int = 0;
     if (!b62_decode(cipher7, 7, &cipher_int)) return false;
     if (cipher_int >= 0x100000000ULL) {
@@ -381,16 +404,15 @@ static bool validate_card_ex(NSString *card_str,
     cipher_bytes[2] = (uint8_t)((cipher_int >> 8)  & 0xFFu);
     cipher_bytes[3] = (uint8_t)( cipher_int        & 0xFFu);
 
-    /* 6. 解尾码 4字符 -> 20bit */
+    /* 6. 解尾码 4 字符 -> 20bit */
     uint64_t actual_tail = 0;
     if (!b62_decode(tail4, 4, &actual_tail)) return false;
-    if (actual_tail > 1048575ULL) return false; /* 20bit 上限 */
+    if (actual_tail > 1048575ULL) return false;
 
-    /* 7. 优先尝试 B (绑定, 如果本地有 device_id), 再尝试 G (通用).
-     *    两种类型独立派生 XOR 密钥流和尾码, 互不干扰. */
+    /* 7. B / G 候选 (绑定优先, 避免 B 被当成 G 错判) */
     NSString *dev_id = get_local_device_id();
-    char match_type = 0;
-    int64_t expire_ts = 0;
+    char match_type  = 0;
+    int64_t gen_ts   = 0;
 
     const char *types[2] = { NULL, NULL };
     NSString *devs[2]   = { nil, nil };
@@ -413,7 +435,7 @@ static bool validate_card_ex(NSString *card_str,
         uint32_t exp_tail = derive_20bit_tail(prefix2, cipher7, crc3, devs[k]);
         if (exp_tail == (uint32_t)actual_tail) {
             match_type = types[k][0];
-            expire_ts = (int64_t)ts;
+            gen_ts = (int64_t)ts;
             break;
         }
     }
@@ -423,25 +445,33 @@ static bool validate_card_ex(NSString *card_str,
         return false;
     }
 
-    /* 8. 有效期检查: 过期单独返回原因码, UI 提示"使用期限已到" */
+    /* 8. v3 关键: 激活窗口检查 (超了就直接 CAR_ERR_EXPIRED) */
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
-    if (expire_ts <= now) {
-        NSLog(@"[card_auth] card already expired at %lld (now=%lld)", expire_ts, now);
+    if (gen_ts <= 0 || now - gen_ts > (int64_t)TIME_ACTIVATION_WINDOW_SEC) {
+        NSLog(@"[card_auth] activation window expired (gen=%lld now=%lld window=%d)",
+              gen_ts, now, TIME_ACTIVATION_WINDOW_SEC);
         if (reason_out) *reason_out = CAR_ERR_EXPIRED;
         return false;
     }
+    /* 防御: 生成时间戳不能是"未来"的 (防止改系统时间倒拨) */
+    if (gen_ts > now + (int64_t)TIME_TAMPER_THRESHOLD) {
+        NSLog(@"[card_auth] gen_ts from future, card suspect tampered");
+        return false;
+    }
 
-    if (expire_out) *expire_out = expire_ts;
-    if (type_out)   *type_out   = match_type;
+    if (gen_out)  *gen_out  = gen_ts;
+    if (dur_out)  *dur_out  = dur;
+    if (type_out) *type_out = match_type;
     if (reason_out) *reason_out = CAR_OK;
     return true;
 }
 
-/* 兼容旧签名: 成功返回到期时间戳, 失败返回 0. (启动校验路径复用) */
+/* 兼容旧签名: 启动路径不使用. 永远返回 0, 请改用 validate_card_ex. */
+__attribute__((unused))
 static int64_t validate_card(NSString *card_str, char *out_type) {
-    int64_t ts = 0;
-    validate_card_ex(card_str, &ts, out_type, NULL);
-    return ts;
+    if (out_type) *out_type = 0;
+    validate_card_ex(card_str, NULL, NULL, NULL, out_type, NULL);
+    return 0;
 }
 
 /* =========================================================
@@ -596,9 +626,9 @@ static CardAuthWindow *g_auth_window = nil;
     card = [card stringByReplacingOccurrencesOfString:@"\r" withString:@""];
 
     char ctype = 0;
-    int64_t expire_ts = 0;
+    int64_t gen_ts = 0, dur_sec = 0;
     int car = CAR_ERR_GENERIC;
-    BOOL ok = validate_card_ex(card, &expire_ts, &ctype, &car);
+    BOOL ok = validate_card_ex(card, NULL, &gen_ts, &dur_sec, &ctype, &car);
     if (!ok) {
         NSLog(@"[card_auth] user input card invalid (reason=%d)", car);
         if (car == CAR_ERR_EXPIRED) {
@@ -611,27 +641,37 @@ static CardAuthWindow *g_auth_window = nil;
         return;
     }
 
-    /* 本机黑名单: 用过的卡密即便还在有效期也不允许第二次激活 */
+    /* 本机黑名单: 用过的激活码不允许二次激活, 哪怕它在同一个激活窗口内 */
     NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
     if ([used containsObject:card]) {
         [self showToast:@"激活码已使用过"];
         return;
     }
 
-    /* 所有校验通过 -> 写入 Keychain, 激活 */
-    kc_set_string(@(KC_ACTIVE_CARD), card);
+    /* ===== v3 核心: 从点击激活这一刻才开始算使用时间 ===== */
+    struct timeval boot = get_boottime();
+    int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+    int64_t actual_expire_ts = now + dur_sec;
+
+    /* 写入 Keychain:
+     *  - KC_ACTIVE_CARD       : 激活码原文 (用于下次启动再确认)
+     *  - KC_ACTIVE_EXPIRE_TS  : 真正的到期时间戳 (字符串数字, 启动时主判定)
+     *  - KC_USED_CARD_LIST    : 加入本机黑名单
+     *  - KC_TIME_CHECK_REC    : 时间篡改记录 (boottime + 墙上时间)
+     */
+    kc_set_string(@(KC_ACTIVE_CARD),       card);
+    kc_set_string(@(KC_ACTIVE_EXPIRE_TS),  [@(actual_expire_ts) stringValue]);
 
     NSMutableArray *new_used = [used mutableCopy];
+    if (!new_used) new_used = [NSMutableArray array];
     [new_used addObject:card];
     kc_set_array(@(KC_USED_CARD_LIST), new_used);
 
-    struct timeval boot = get_boottime();
-    int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
     NSDictionary *rec = @{
         @"last_check_time": @(now),
         @"last_boottime":   @((int64_t)boot.tv_sec)
     };
-    NSData *rec_data = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
+    NSData *rec_data  = [NSJSONSerialization dataWithJSONObject:rec options:0 error:nil];
     NSString *rec_json = [[NSString alloc] initWithData:rec_data
                                                 encoding:NSUTF8StringEncoding];
     kc_set_string(@(KC_TIME_CHECK_REC), rec_json);
@@ -743,8 +783,9 @@ static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
          * 注意: 此处绝对不能调用 exit(0), 也不能弹 UIAlert(易闪退).
          *       正确做法是把用户留在激活窗口, g_is_activated 保持 false,
          *       sendEvent 会继续拦截触摸, 用户无法进入主界面. */
-        kc_set_string(@(KC_ACTIVE_CARD), @"");
-        kc_set_string(@(KC_TIME_CHECK_REC), @"");
+        kc_set_string(@(KC_ACTIVE_CARD),      @"");
+        kc_set_string(@(KC_ACTIVE_EXPIRE_TS), @"");
+        kc_set_string(@(KC_TIME_CHECK_REC),   @"");
 
         if (!g_auth_window) {
             g_auth_window = [[CardAuthWindow alloc] init];
@@ -766,29 +807,56 @@ static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
  * ========================================================= */
 
 static void check_authorization(void) {
-    /* 1. 读 Keychain: 当前激活卡密 */
-    NSString *active_card = kc_get_string(@(KC_ACTIVE_CARD));
-    if (!active_card || active_card.length == 0) {
+    /* 1. 读 Keychain: KC_ACTIVE_EXPIRE_TS = 激活成功时写入的真正到期时间戳 (字符串数字)
+     *    KC_ACTIVE_CARD = 当时激活的 16 位激活码, 用作二次校验. */
+    NSString *exp_str   = kc_get_string(@(KC_ACTIVE_EXPIRE_TS));
+    NSString *active_cd = kc_get_string(@(KC_ACTIVE_CARD));
+
+    if ((!exp_str || exp_str.length == 0) &&
+        (!active_cd || active_cd.length == 0)) {
         g_is_activated = false;
         show_auth_window_on_main();
         return;
     }
-
-    /* 2. 重新校验激活码有效性 (解出到期时间) */
-    char ctype = 0;
-    int64_t expire_ts = validate_card(active_card, &ctype);
-    if (expire_ts <= 0) {
+    if (!exp_str || exp_str.length == 0) {
+        /* 老数据 (v2 只写 KC_ACTIVE_CARD): 视为不完整, 强制重激活 */
         g_is_activated = false;
         show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
         return;
     }
 
-    /* 3. 获取当前系统时间、boottime */
+    /* 2. 解析到期时间戳 (主判定依据). longLongValue 解析失败返回 0, 会被下一个分支自然拦住 */
+    int64_t stored_expire_ts = [exp_str longLongValue];
     int64_t now = (int64_t)[[NSDate date] timeIntervalSince1970];
+
+    if (stored_expire_ts <= 0 || now > stored_expire_ts) {
+        g_is_activated = false;
+        show_fatal_alert_on_main(@"使用期限已到", @"请联系客服获取新的激活码");
+        return;
+    }
+
+    /* 3. 可选二次校验: 激活码原文 CRC+尾码 仍然合法 (不通过激活窗口判断, 只判断格式/密钥)
+     *    这里传 NULL 到 reason_out, 且仅用于格式级别的校验, 不再套用「激活窗口」
+     *    的过期判定 (因为 activation window 是针对"首次激活"的, 已经激活过的
+     *    KC_ACTIVE_CARD 肯定老早就超过窗口, 用窗口判断就错了). */
+    if (active_cd && active_cd.length == 16) {
+        /* 走格式+CRC+尾码 的"结构级"核验, 不关心 gen_ts 的时效性. 为此
+         * 直接调用 validate_card_ex 后, 忽略 CAR_ERR_EXPIRED (超激活窗口),
+         * 只在结构本身损坏 (CAR_ERR_GENERIC) 时判失败. */
+        int car = CAR_OK;
+        BOOL good = validate_card_ex(active_cd, NULL, NULL, NULL, NULL, &car);
+        if (!good && car != CAR_ERR_EXPIRED) {
+            NSLog(@"[card_auth] saved active card corrupted (reason=%d)", car);
+            g_is_activated = false;
+            show_fatal_alert_on_main(@"激活失效", @"请重新输入激活码");
+            return;
+        }
+    }
+
+    /* 4. 获取当前 boottime + 上次校验记录, 做时间篡改检测 */
     struct timeval boot = get_boottime();
     int64_t boot_sec = (int64_t)boot.tv_sec;
 
-    /* 4. 读取上一次校验记录 */
     NSString *rec_json = kc_get_string(@(KC_TIME_CHECK_REC));
     int64_t last_check_time = 0;
     int64_t last_boottime = 0;
@@ -802,7 +870,6 @@ static void check_authorization(void) {
         }
     }
 
-    /* 5. 时间校验 */
     if (last_check_time > 0 && last_boottime > 0) {
         int64_t wall_delta = now - last_check_time;
         int64_t boot_delta = boot_sec - last_boottime;
@@ -815,14 +882,7 @@ static void check_authorization(void) {
         }
     }
 
-    /* 6. 过期检测 */
-    if (now > expire_ts) {
-        g_is_activated = false;
-        show_fatal_alert_on_main(@"使用期限已到", @"请联系客服获取新的激活码");
-        return;
-    }
-
-    /* 7. 全部校验通过: 激活 */
+    /* 5. 全部校验通过: 激活 */
     g_is_activated = true;
 
     /* 回写时间记录 */
