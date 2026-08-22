@@ -6,9 +6,10 @@
  *
  * 卡密规范摘要:
  *   档位: S30 M1 H1 H3 D1 W7 M30 M90 Y1 Y10
- *   通用卡密(G):  PREFIX-G-Fernet(到期Unix时间戳)
- *   绑定卡密(B):  PREFIX-B-Fernet(到期时间戳||identifierForVendor)
+ *   通用卡密(G):  PREFIX:G:Fernet(到期Unix时间戳)
+ *   绑定卡密(B):  PREFIX:B:Fernet(到期时间戳||identifierForVendor)
  *   全部档位均支持 G 通用 / B 绑定 两种类型
+ *   分隔符为 ':', 不与 Fernet base64url 字符集冲突
  *
  * 固有局限（纯本地无服务器，逆向可Hook绕过，清空钥匙串重置本地状态）:
  *   1. G 通用卡密支持多设备共用; B 绑定卡密仅限指定设备
@@ -514,24 +515,25 @@ static CardAuthWindow *g_auth_window = nil;
 
 - (bool)parseAndValidateCard:(NSString *)card_str {
     NSLog(@"[card_auth] parseAndValidateCard: input len=%lu", (unsigned long)card_str.length);
-    /* 1. 格式校验: 前缀-类型-密文
-     * 注意: Fernet base64url 密文本身包含 '-' 字符,
-     * 所以只能用前两个 '-' 分隔 prefix 和 type,
-     * 剩余部分重新拼接为完整密文 */
-    NSArray *parts = [card_str componentsSeparatedByString:@"-"];
-    NSLog(@"[card_auth] split -> %lu parts", (unsigned long)parts.count);
+    /* 1. 格式校验: 前缀:类型:密文
+     * 使用 ':' 做分隔符, 因为 Fernet base64url 编码不含 ':',
+     * 不会与密文内容冲突, 无需担心 split 问题 */
+    NSArray *parts = [card_str componentsSeparatedByString:@":"];
+    NSLog(@"[card_auth] split by ':' -> %lu parts", (unsigned long)parts.count);
     if (parts.count < 3) {
+        NSLog(@"[card_auth] FAIL: parts < 3 (got %lu)", (unsigned long)parts.count);
         [self showToast:@"卡密无效"];
         return false;
     }
     NSString *prefix = parts[0];
     NSString *type   = parts[1];
-    /* 剩余部分用 '-' 重新拼接, 还原完整 Fernet 密文 */
+    /* 剩余部分用 ':' 重新拼接 (虽然正常情况下只有1段密文,
+     * 但保持兼容以防密文意外含 ':') */
     NSMutableArray *cipherParts = [NSMutableArray arrayWithCapacity:parts.count - 2];
     for (NSUInteger i = 2; i < parts.count; i++) {
         [cipherParts addObject:parts[i]];
     }
-    NSString *cipher = [cipherParts componentsJoinedByString:@"-"];
+    NSString *cipher = [cipherParts componentsJoinedByString:@":"];
     NSLog(@"[card_auth] prefix=%@ type=%@ cipher_len=%lu", prefix, type, (unsigned long)cipher.length);
 
     /* 前缀合法性 */
@@ -669,8 +671,8 @@ static void show_auth_window_on_main(void) {
             clean = [clean stringByReplacingOccurrencesOfString:@" " withString:@""];
             clean = [clean stringByReplacingOccurrencesOfString:@"\n" withString:@""];
             clean = [clean stringByReplacingOccurrencesOfString:@"\r" withString:@""];
-            /* 简单检查: 卡密格式 前缀-类型-密文, 至少包含两个 '-' */
-            NSArray *testParts = [clean componentsSeparatedByString:@"-"];
+            /* 简单检查: 卡密格式 前缀:类型:密文, 至少包含两个 ':' */
+            NSArray *testParts = [clean componentsSeparatedByString:@":"];
             if (testParts.count >= 3) {
                 /* 看起来像卡密, 填入输入框 */
                 g_auth_window.inputField.text = clean;
