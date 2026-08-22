@@ -431,7 +431,9 @@ static int64_t validate_card(NSString *card_str, char *out_type) {
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UITextField *inputField;
 @property (nonatomic, strong) UILabel *hintLabel;
+@property (nonatomic, strong) UILabel *stickyInfoLabel;
 - (void)showToast:(NSString *)msg;
+- (void)showStickyInfo:(NSString *)title detail:(NSString *)detail;
 - (void)showErrorAlert:(NSString *)title message:(NSString *)msg;
 - (void)dismissWindow;
 @end
@@ -447,19 +449,32 @@ static CardAuthWindow *g_auth_window = nil;
 
     CGFloat sw = self.view.bounds.size.width;
 
+    /* 0. 顶部状态条 (到期 / 异常时显示, 初始隐藏) */
+    self.stickyInfoLabel = [[UILabel alloc] init];
+    self.stickyInfoLabel.numberOfLines = 0;
+    self.stickyInfoLabel.font = [UIFont boldSystemFontOfSize:13];
+    self.stickyInfoLabel.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:1.0];
+    self.stickyInfoLabel.backgroundColor = [UIColor colorWithRed:0.25 green:0.15 blue:0.05 alpha:0.95];
+    self.stickyInfoLabel.textAlignment = NSTextAlignmentCenter;
+    self.stickyInfoLabel.layer.cornerRadius = 8;
+    self.stickyInfoLabel.layer.masksToBounds = YES;
+    self.stickyInfoLabel.hidden = YES;
+    self.stickyInfoLabel.frame = CGRectMake(16, 18, sw - 32, 36);
+    [self.view addSubview:self.stickyInfoLabel];
+
     /* 1. 提示标签 */
     self.hintLabel = [[UILabel alloc] init];
-    self.hintLabel.text = @"请输入16位卡密激活\n(大小写字母+数字)";
+    self.hintLabel.text = @"欢迎使用，请输入激活码";
     self.hintLabel.numberOfLines = 0;
-    self.hintLabel.font = [UIFont systemFontOfSize:13];
+    self.hintLabel.font = [UIFont systemFontOfSize:14];
     self.hintLabel.textColor = [UIColor whiteColor];
     self.hintLabel.textAlignment = NSTextAlignmentCenter;
-    self.hintLabel.frame = CGRectMake(20, 50, sw - 40, 90);
+    self.hintLabel.frame = CGRectMake(20, 66, sw - 40, 50);
     [self.view addSubview:self.hintLabel];
 
-    /* 2. 卡密输入框 (16位 短卡密) */
+    /* 2. 激活码输入框 */
     self.inputField = [[UITextField alloc] init];
-    self.inputField.placeholder = @"16位卡密(字母数字,大小写敏感)";
+    self.inputField.placeholder = @"请输入激活码";
     self.inputField.borderStyle = UITextBorderStyleRoundedRect;
     self.inputField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     self.inputField.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -467,15 +482,15 @@ static CardAuthWindow *g_auth_window = nil;
     self.inputField.smartQuotesType = UITextSmartQuotesTypeNo;
     self.inputField.smartDashesType = UITextSmartDashesTypeNo;
     self.inputField.delegate = self;
-    self.inputField.frame = CGRectMake(20, 150, sw - 40, 44);
+    self.inputField.frame = CGRectMake(20, 130, sw - 40, 44);
     [self.view addSubview:self.inputField];
 
-    CGFloat btnY = 208;
+    CGFloat btnY = 188;
     CGFloat btnW = (sw - 50) / 2.0;
 
-    /* 3. 一键复制设备信息按钮 */
+    /* 3. 复制设备信息按钮 */
     UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [copyBtn setTitle:@"复制设备ID" forState:UIControlStateNormal];
+    [copyBtn setTitle:@"复制本机码" forState:UIControlStateNormal];
     [copyBtn.titleLabel setFont:[UIFont systemFontOfSize:15]];
     copyBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:0.2 alpha:1.0];
     [copyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -487,7 +502,7 @@ static CardAuthWindow *g_auth_window = nil;
 
     /* 4. 激活按钮 */
     UIButton *activateBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [activateBtn setTitle:@"激活" forState:UIControlStateNormal];
+    [activateBtn setTitle:@"立即激活" forState:UIControlStateNormal];
     [activateBtn.titleLabel setFont:[UIFont systemFontOfSize:15]];
     activateBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.4 blue:0.8 alpha:1.0];
     [activateBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -497,33 +512,56 @@ static CardAuthWindow *g_auth_window = nil;
       forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:activateBtn];
 
-    /* 5. 退出按钮: exit(0) 杀死进程 */
+    /* 5. 退出按钮 */
     UIButton *exitBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [exitBtn setTitle:@"退出" forState:UIControlStateNormal];
+    [exitBtn setTitle:@"关闭软件" forState:UIControlStateNormal];
     [exitBtn.titleLabel setFont:[UIFont systemFontOfSize:15]];
     exitBtn.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:1.0];
     [exitBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     exitBtn.layer.cornerRadius = 8;
-    exitBtn.frame = CGRectMake(20, 263, sw - 40, 40);
+    exitBtn.frame = CGRectMake(20, 243, sw - 40, 40);
     [exitBtn addTarget:self action:@selector(exitPressed:)
       forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:exitBtn];
 }
 
+- (void)showStickyInfo:(NSString *)title detail:(NSString *)detail {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.stickyInfoLabel) return;
+        NSString *text;
+        if (detail && detail.length > 0) {
+            text = [NSString stringWithFormat:@"%@\n%@", title, detail];
+        } else {
+            text = title;
+        }
+        self.stickyInfoLabel.text = text;
+        self.stickyInfoLabel.hidden = NO;
+        /* 根据内容动态调整高度 */
+        CGFloat sw = self.view.bounds.size.width;
+        CGRect r = self.stickyInfoLabel.frame;
+        r.size.height = [text boundingRectWithSize:CGSizeMake(sw - 32, CGFLOAT_MAX)
+                                            options:NSStringDrawingUsesLineFragmentOrigin
+                                         attributes:@{NSFontAttributeName:self.stickyInfoLabel.font}
+                                            context:nil].size.height + 18;
+        r.origin.x = 16; r.size.width = sw - 32; r.origin.y = 18;
+        self.stickyInfoLabel.frame = r;
+    });
+}
+
 - (void)copyDeviceID:(UIButton *)sender {
     NSString *devID = get_local_device_id();
     if (devID.length == 0) {
-        [self showToast:@"无法获取设备ID"];
+        [self showToast:@"获取失败，请重试"];
         return;
     }
     [UIPasteboard generalPasteboard].string = devID;
-    [self showToast:@"设备ID已复制，发给开发者生成绑定卡密"];
+    [self showToast:@"本机码已复制，发给客服即可"];
 }
 
 - (void)activatePressed:(UIButton *)sender {
     NSString *card = self.inputField.text;
     if (card.length == 0) {
-        [self showToast:@"请输入卡密"];
+        [self showToast:@"请输入激活码"];
         return;
     }
     /* 清理输入: 去空格换行 (支持用户 4+4+4+4 分组粘贴) */
@@ -536,14 +574,14 @@ static CardAuthWindow *g_auth_window = nil;
     int64_t expire_ts = validate_card(card, &ctype);
     if (expire_ts <= 0) {
         NSLog(@"[card_auth] user input card invalid");
-        [self showToast:@"卡密无效"];
+        [self showToast:@"激活码无效"];
         return;
     }
 
     /* 本机黑名单 */
     NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
     if ([used containsObject:card]) {
-        [self showToast:@"卡密无效"];
+        [self showToast:@"激活码已使用过"];
         return;
     }
 
@@ -583,7 +621,9 @@ static CardAuthWindow *g_auth_window = nil;
         toast.textAlignment = NSTextAlignmentCenter;
         toast.numberOfLines = 0;
         toast.alpha = 0;
-        toast.frame = CGRectMake(20, 323, self.view.bounds.size.width - 40, 44);
+        CGFloat y = self.view.bounds.size.height - 110;
+        if (y < 280) y = 280;
+        toast.frame = CGRectMake(20, y, self.view.bounds.size.width - 40, 44);
         toast.layer.cornerRadius = 8;
         toast.layer.masksToBounds = YES;
         [self.view addSubview:toast];
@@ -657,31 +697,44 @@ static void show_auth_window_on_main(void) {
                 }
                 if (all_ok) {
                     g_auth_window.inputField.text = clean;
-                    [g_auth_window showToast:@"检测到剪贴板卡密，已自动填入"];
+                    [g_auth_window showToast:@"检测到剪贴板有激活码，已自动填入"];
                 }
             }
         }
     });
 }
 
-static void show_fatal_alert_on_main(NSString *title, NSString *msg) {
+/* 双参数(逗号)兼容形式, 调用处写法: show_fatal_alert_on_main(@"a", @"b")
+ * 注意: Objective-C 中调用者使用 func(@"a", @"b") 形式 (圆括号,逗号分隔),
+ *       这种普通 C 函数调用与当前 show_fatal_alert_on_main 的参数列表天然匹配,
+ *       保留 wrapper 仅做未来签名变更时向下兼容. */
+static void show_fatal_alert_on_main_compat(NSString *title, NSString *msg) {
+    show_fatal_alert_on_main(title, msg);
+}
+
+static void show_fatal_alert_on_main(NSString *title, NSString *detail) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:title message:msg
-                      preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *exitAct = [UIAlertAction
-            actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
-                   handler:^(UIAlertAction *_) { exit(0); }];
-        [alert addAction:exitAct];
-        UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        win.windowLevel = UIWindowLevelAlert + 100;
-        win.rootViewController = [[UIViewController alloc] init];
-        win.hidden = NO;
-        [win makeKeyAndVisible];
-        [win.rootViewController presentViewController:alert
-                                            animated:YES completion:nil];
+        /* 致命场景: 先清掉旧授权, 弹出激活窗口并在顶部提示.
+         * 注意: 此处绝对不能调用 exit(0), 也不能弹 UIAlert(点退出闪退).
+         *       正确做法是把用户留在激活窗口, g_is_activated 保持 false,
+         *       sendEvent 会继续拦截触摸, 用户无法进入主界面. */
+        kc_set_string(@(KC_ACTIVE_CARD), @"");
+        kc_set_string(@(KC_TIME_CHECK_REC), @"");
+
+        if (!g_auth_window) {
+            g_auth_window = [[CardAuthWindow alloc] init];
+            UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            win.windowLevel = UIWindowLevelAlert + 100;
+            win.rootViewController = g_auth_window;
+            g_auth_window.window = win;
+            win.hidden = NO;
+            [win makeKeyAndVisible];
+        }
+        /* 在激活窗口顶部显示原因 */
+        [g_auth_window showStickyInfo:title detail:msg];
     });
 }
+
 
 /* =========================================================
  *  模块 B: 授权状态校验主逻辑
@@ -696,13 +749,13 @@ static void check_authorization(void) {
         return;
     }
 
-    /* 2. 重新校验卡密有效性 (解出到期时间) */
+    /* 2. 重新校验激活码有效性 (解出到期时间) */
     char ctype = 0;
     int64_t expire_ts = validate_card(active_card, &ctype);
     if (expire_ts <= 0) {
         g_is_activated = false;
-        show_fatal_alert_on_main(@"授权数据无效",
-                                  @"本地授权数据无法验证, 请重新激活");
+        show_fatal_alert_on_main(@"激活失效"
+                                  detail:@"请重新输入激活码");
         return;
     }
 
@@ -725,7 +778,7 @@ static void check_authorization(void) {
         }
     }
 
-    /* 5. 时间篡改检测 */
+    /* 5. 时间校验 */
     if (last_check_time > 0 && last_boottime > 0) {
         int64_t wall_delta = now - last_check_time;
         int64_t boot_delta = boot_sec - last_boottime;
@@ -733,8 +786,8 @@ static void check_authorization(void) {
         if (diff < 0) diff = -diff;
         if (diff > TIME_TAMPER_THRESHOLD) {
             g_is_activated = false;
-            show_fatal_alert_on_main(@"时间篡改",
-                                      @"检测到系统时间异常, 授权已失效");
+            show_fatal_alert_on_main(@"系统时间异常"
+                                      detail:@"请确认手机时间正确后重试");
             return;
         }
     }
@@ -742,8 +795,8 @@ static void check_authorization(void) {
     /* 6. 过期检测 */
     if (now > expire_ts) {
         g_is_activated = false;
-        show_fatal_alert_on_main(@"已过期",
-                                  @"卡密已超过有效期, 授权已失效");
+        show_fatal_alert_on_main(@"使用期限已到"
+                                  detail:@"请联系客服获取新的激活码");
         return;
     }
 
