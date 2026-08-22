@@ -571,14 +571,22 @@ static CardAuthWindow *g_auth_window = nil;
     card = [card stringByReplacingOccurrencesOfString:@"\r" withString:@""];
 
     char ctype = 0;
-    int64_t expire_ts = validate_card(card, &ctype);
-    if (expire_ts <= 0) {
-        NSLog(@"[card_auth] user input card invalid");
-        [self showToast:@"激活码无效"];
+    int64_t expire_ts = 0;
+    int car = CAR_ERR_GENERIC;
+    BOOL ok = validate_card_ex(card, &expire_ts, &ctype, &car);
+    if (!ok) {
+        NSLog(@"[card_auth] user input card invalid (reason=%d)", car);
+        if (car == CAR_ERR_EXPIRED) {
+            [self showToast:@"使用期限已到，请联系客服更换"];
+        } else if (card.length < 16) {
+            [self showToast:@"激活码位数不够"];
+        } else {
+            [self showToast:@"激活码无效"];
+        }
         return;
     }
 
-    /* 本机黑名单 */
+    /* 本机黑名单: 用过的卡密即便还在有效期也不允许第二次激活 */
     NSArray *used = kc_get_array(@(KC_USED_CARD_LIST));
     if ([used containsObject:card]) {
         [self showToast:@"激活码已使用过"];
