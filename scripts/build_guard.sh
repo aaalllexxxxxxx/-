@@ -13,14 +13,16 @@ echo "$SALT" > "$OUT_DIR/salt.txt"
 echo "$MAGIC" > "$OUT_DIR/magic.txt"
 echo "[*] guard string key: $KEY, js salt: $SALT, js magic: $MAGIC"
 
-# 若存在 src/card_auth.m，与 guard.c 合并编译为单一 dylib：
-# card_auth constructor(101) 先执行卡密校验，失败 exit(0)，guard 的 JS 加载不会执行
+# 若存在 src/auth/*.mm（AuthDylib 卡密验证），与 guard.c + guard_bridge.mm
+# 合并编译为单一 dylib，并启用桥接模式（JS 加载由卡密状态控制）
 SRCS="src/guard.c"
-EXTRA_FRAMEWORKS=""
-if [ -f src/card_auth.m ]; then
-  echo "[*] card_auth.m detected, merging into single dylib"
-  SRCS="$SRCS src/card_auth.m"
-  EXTRA_FRAMEWORKS="-framework UIKit -framework Security"
+EXTRA_FLAGS=""
+EXTRA_LDFLAGS=""
+if ls src/auth/*.mm >/dev/null 2>&1; then
+  echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
+  SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
+  EXTRA_FLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc"
+  EXTRA_LDFLAGS="-lc++ -framework UIKit -framework Security -framework CoreGraphics"
 fi
 
 for ARCH in arm64; do
@@ -29,14 +31,15 @@ for ARCH in arm64; do
     -dynamiclib \
     -install_name "@executable_path/Frameworks/libguard.dylib" \
     -framework Foundation \
-    $EXTRA_FRAMEWORKS \
     -fvisibility=hidden \
     -O2 \
     -DGUARD_STR_KEY=$KEY \
     -DGUARD_JS_SALT=${SALT}ULL \
     -DGUARD_JS_MAGIC=${MAGIC}ULL \
-    -mios-version-min=12.0 \
+    -mios-version-min=13.0 \
+    $EXTRA_FLAGS \
     $SRCS \
+    $EXTRA_LDFLAGS \
     -o "$OUT_DIR/libguard_$ARCH.dylib"
 done
 

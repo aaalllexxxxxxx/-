@@ -164,16 +164,21 @@ Actions → "IPA Hardening" → Run workflow：
 
 **自定义伪装名**：编辑仓库根目录 `camouflage.conf`，建议参考你 App 内已有库的命名风格，避免 crypto/guard/frida/agent 等敏感词。
 
-### 卡密验证整合（card_auth.m）
+### 卡密验证整合（AuthDylib，src/auth/）
 
-`src/card_auth.m` 存在时，构建脚本自动把它与 `guard.c` 合并编译为**单一 dylib**，利用 constructor 优先级实现联动：
+`src/auth/` 存在时，构建脚本自动把 AuthDylib 卡密验证与 `guard.c` 合并编译为**单一 dylib**，并通过 `src/guard_bridge.mm` 实现 JS 加载与卡密状态的硬联动：
 
-1. `card_auth` 用 `constructor(101)`（最高优先级）先执行卡密校验
-2. 校验失败/到期/时间篡改 → `exit(0)` 进程终止，`guard` 的 constructor 不会执行，JS 永不加载
-3. 校验通过 → `guard` 执行反调试/反 hook，全部通过后解密加载 JS
-4. 卡密校验被 patch 绕过 → `guard` 的反 hook 检测命中，随机延迟崩溃
+| 卡密状态 | JS 加载行为 |
+|---|---|
+| 无本地凭据（新用户） | 卡密面板弹出挡界面，JS 不加载 |
+| 激活成功 | 收到 `AuthUIActivatedNotification`，立即加载 JS |
+| 老用户（有凭据） | 离线宽限期内先加载，同时心跳确认；心跳 OK 也加载 |
+| 服务端拒绝（禁用/解绑/验签失败） | 已加载的 JS 随进程终止（`guard_request_die`） |
+| 卡密逻辑被 patch 移除 | guard 反 hook 检测命中，随机延迟崩溃 |
 
-**注意**：`card_auth.m` 顶部的 `g_card_key` 是占位密钥（0x11...0x10），必须替换为与你 `gen_card.py` 发卡脚本一致的真实 32 字节密钥，否则所有卡密都校验失败。
+**必做配置**：编辑 `src/auth/Config.h`，填入 `AUTH_SERVER_URL`（你的卡密后台地址）和面板标题，否则验证无法工作。
+
+### 生产级安全设计
 
 ### 生产级安全设计
 

@@ -174,6 +174,14 @@ static uint64_t digest_self(void) {
  * 不直接 abort：随机延迟 0-30s 后，通过空指针写入崩溃，
  * 崩溃点远离检测点，增加攻击者用断点/日志定位检测逻辑的成本。
  */
+static void guard_die(void);
+
+/* 导出给 guard_bridge.mm：卡密被服务端拒绝时终止进程 */
+__attribute__((visibility("default")))
+void guard_request_die(void) {
+    guard_die();
+}
+
 static void guard_die(void) {
     if (g_page) g_page->flags |= 1ULL << 63;   /* 留痕：宿主侧可见 */
     unsigned jitter = arc4random_uniform(30000);
@@ -301,7 +309,9 @@ static void derive_js_key(uint8_t out[CC_SHA256_DIGEST_LENGTH],
     CC_SHA256_Final(out, &ctx);
 }
 
-static int load_frida_agent(void) {
+/* 导出给 guard_bridge.mm 调用（卡密联动）；独立使用时由 constructor 直接调用 */
+__attribute__((visibility("default")))
+int guard_load_frida_agent(void) {
     char base[PATH_MAX];
     uint32_t sz = sizeof(base);
     if (_NSGetExecutablePath(base, &sz) != 0) return -1;
@@ -367,7 +377,7 @@ static int load_frida_agent(void) {
     char gadget_path[PATH_MAX];
     Dl_info self_info;
     const char *self_name = NULL;
-    if (dladdr((void *)load_frida_agent, &self_info) && self_info.dli_fname)
+    if (dladdr((void *)guard_load_frida_agent, &self_info) && self_info.dli_fname)
         self_name = strrchr(self_info.dli_fname, '/');
     if (find_gadget_by_size(fw_dir, self_name, gadget_path, sizeof(gadget_path)) != 0)
         return -1;
@@ -408,10 +418,13 @@ static void guard_init(void) {
     g_page->heartbeat   = 1;
     g_page->flags       = 0;
 
-    /* 先做一轮快速环境检查，全部通过才允许加载 Frida JS */
+#ifndef GUARD_AUTH_BRIDGE
+    /* 独立模式（无卡密模块）：先做一轮快速环境检查，通过即加载 Frida JS。
+     * 桥接模式（-DGUARD_AUTH_BRIDGE）：JS 加载由 guard_bridge.mm 按卡密状态控制 */
     if (!debugger_attached() && !injected_framework_present() && !prologue_tampered()) {
-        load_frida_agent();
+        guard_load_frida_agent();
     }
+#endif
 
     pthread_t t;
     pthread_create(&t, NULL, guard_loop, NULL);
