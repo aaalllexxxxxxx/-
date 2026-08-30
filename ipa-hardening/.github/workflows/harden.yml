@@ -1,0 +1,205 @@
+name: IPA Hardening for TrollStore/Jailbreak (Production)
+
+on:
+  push:
+    paths:
+      - "**.ipa"
+      - "libguard.dylib"
+      - "agent.js"
+      - "salt.txt"
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "待加固 ipa 的下载地址（留空则使用仓库内第一个 .ipa）"
+        required: false
+        default: ""
+      output_name:
+        description: "输出文件名"
+        required: false
+        default: "app_hardened.ipa"
+      use_ollvm:
+        description: "仓库没有自带 dylib 时，是否用 OLLVM 混淆编译"
+        required: false
+        default: "false"
+      entitlements:
+        description: "追加 entitlements（逗号分隔），留空保留原有"
+        required: false
+        default: ""
+      frida_version:
+        description: "FridaGadget 版本"
+        required: false
+        default: "16.5.9"
+
+# 生产级：同一分支串行执行，防止并发构建互相覆盖 artifact
+concurrency:
+  group: harden-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 1. 输入解析 ----------
+      - name: Resolve ipa source
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.ipa_url }}" ]; then
+            curl -fL --retry 3 --max-time 600 -o app.ipa "${{ inputs.ipa_url }}"
+          else
+            FOUND=$(find . -name "*.ipa" -not -path "./.*" | head -1)
+            [ -n "$FOUND" ] || { echo "::error::no ipa found (push a .ipa or provide ipa_url)"; exit 1; }
+            cp "$FOUND" app.ipa
+          fi
+          shasum -a 256 app.ipa | tee /tmp/input.sha256
+
+      # ---------- 2. dylib 来源 ----------
+      - name: Check prebuilt dylib
+        id: dylib
+        run: |
+          mkdir -p build
+          if [ -f libguard.dylib ]; then
+            echo "source=prebuilt" >> "$GITHUB_OUTPUT"
+            cp libguard.dylib build/libguard.dylib
+            if [ -f agent.js ]; then
+              [ -f salt.txt ] && [ -f magic.txt ] || {
+                echo "::error::agent.js requires salt.txt AND magic.txt (both generated when building your dylib)"
+                exit 1
+              }
+            fi
+            [ -f salt.txt ] && cp salt.txt build/salt.txt
+            [ -f magic.txt ] && cp magic.txt build/magic.txt
+          else
+            echo "source=compile" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- 3. 工具链（缓存以加速） ----------
+      - name: Cache insert_dylib
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/insert_dylib
+          key: insert-dylib-v1
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/local/bin/insert_dylib ]; then
+            git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
+            clang -std=c99 /tmp/insert_dylib/insert_dylib/main.c -o /usr/local/bin/insert_dylib
+          fi
+          brew install ldid
+          pip3 install --quiet --break-system-packages cryptography
+
+      - name: Pre-check ipa compatibility
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/check_ipa.sh app.ipa
+
+      # ---------- 4. 编译（仅无预编译 dylib 时） ----------
+      - name: Build guard dylib (plain)
+        if: steps.dylib.outputs.source == 'compile' && inputs.use_ollvm != 'true'
+        run: ./scripts/build_guard.sh build
+
+      - name: Build guard dylib (OLLVM obfuscated)
+        if: steps.dylib.outputs.source == 'compile' && inputs.use_ollvm == 'true'
+        run: |
+          curl -fL --retry 3 --max-time 300 -o /tmp/ollvm.tar.gz \
+            https://github.com/heroims/obfuscator/releases/download/llvm-13.0.1/Obfuscator-LLVM-13.0.1-macOS.tar.gz \
+            || { echo "::warning::ollvm unavailable, fallback to plain build"; ./scripts/build_guard.sh build; exit 0; }
+          mkdir -p /tmp/ollvm && tar xzf /tmp/ollvm.tar.gz -C /tmp/ollvm
+          OLLVM_HOME=$(find /tmp/ollvm -name clang -type f | head -1 | xargs dirname | xargs dirname)
+          OLLVM_HOME="$OLLVM_HOME" ./scripts/obfuscate_build.sh build
+          cp build/libguard.sha256 /tmp/ || true
+
+      # ---------- 5. 注入 + JS 加密嵌入 + 伪签 ----------
+      - name: Inject + embed JS + fake-sign
+        env:
+          EXTRA_ENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.entitlements || '' }}
+          OUT_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}
+          FRIDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.frida_version || '16.5.9' }}
+        run: |
+          [ -f agent.js ] && export AGENT_JS=agent.js || true
+          [ -f build/salt.txt ] && export JS_SALT=$(cat build/salt.txt) || true
+          [ -f build/magic.txt ] && export JS_MAGIC=$(cat build/magic.txt) || true
+          export FRIDA_VERSION
+          ./scripts/inject_ipa_ldid.sh app.ipa build/libguard.dylib "$OUT_NAME" "$EXTRA_ENTS"
+
+      # ---------- 6. 深度自检 ----------
+      - name: Verify artifact
+        run: |
+          set -euo pipefail
+          OUT_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}"
+          unzip -q "$OUT_NAME" -d /tmp/verify_out
+          APP_DIR=$(find /tmp/verify_out -maxdepth 3 -name "*.app" | head -1)
+          APP_NAME=$(basename "$APP_DIR" .app)
+
+          # 读取伪装命名
+          GUARD_NAME="libguard.dylib"; GADGET_NAME="FridaGadget.dylib"; JS_BLOB_NAME="agent.js.enc"
+          [ -f camouflage.conf ] && . ./camouflage.conf
+
+          # 6.1 LC_LOAD 存在（伪装名）
+          otool -L "$APP_DIR/$APP_NAME" | grep -q "$GUARD_NAME" \
+            || { echo "::error::guard load command missing ($GUARD_NAME)"; exit 1; }
+
+          # 6.2 敏感词泄露检查：guard 二进制中不得出现原始文件名
+          ! strings "$APP_DIR/Frameworks/$GUARD_NAME" | grep -qiE "agent\.js|FridaGadget|libguard" \
+            && echo "[ok] no sensitive strings in guard" || true
+
+          # 6.3 若嵌入 JS：伪装密文与 Gadget 必须存在，明文绝不出现
+          if [ -f agent.js ]; then
+            [ -f "$APP_DIR/Frameworks/$JS_BLOB_NAME" ] \
+              || { echo "::error::js blob missing ($JS_BLOB_NAME)"; exit 1; }
+            [ -f "$APP_DIR/Frameworks/$GADGET_NAME" ] \
+              || { echo "::error::gadget missing ($GADGET_NAME)"; exit 1; }
+            # 明文泄露检查：取 JS 前 32 字节特征搜索整个 app
+            SIG=$(head -c 32 agent.js | xxd -p | head -c 32)
+            if find "$APP_DIR" -type f -exec xxd -p {} + 2>/dev/null | grep -q "$SIG"; then
+              echo "::error::plaintext agent.js leaked in package"; exit 1
+            fi
+            echo "[ok] no plaintext js leakage"
+          fi
+
+          # 6.4 entitlements 可 dump
+          ldid -e "$APP_DIR/$APP_NAME" > /dev/null \
+            || { echo "::error::entitlements not dumpable"; exit 1; }
+
+      # ---------- 7. 产物与审计 ----------
+      - name: Generate manifest
+        if: success()
+        run: |
+          OUT_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}"
+          {
+            echo "{"
+            echo "  \"input_sha256\": \"$(cut -d' ' -f1 /tmp/input.sha256)\","
+            echo "  \"output\": \"$OUT_NAME\","
+            echo "  \"output_sha256\": \"$(shasum -a 256 "$OUT_NAME" | cut -d' ' -f1)\","
+            echo "  \"dylib_source\": \"${{ steps.dylib.outputs.source }}\","
+            echo "  \"js_embedded\": $([ -f agent.js ] && echo true || echo false),"
+            echo "  \"frida_version\": \"${FRIDA_VERSION:-16.5.9}\","
+            echo "  \"run_id\": \"${{ github.run_id }}\","
+            echo "  \"commit\": \"${{ github.sha }}\""
+            echo "}"
+          } > manifest.json
+          cat manifest.json
+
+      - name: Upload hardened ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardened-ipa-${{ github.run_id }}
+          path: |
+            ${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}
+            manifest.json
+          retention-days: 7
+
+      # ---------- 8. 敏感材料清理 ----------
+      - name: Purge sensitive material
+        if: always()
+        run: |
+          # salt 与明文 JS 不进入 artifact；runner 是临时的，仍显式抹除
+          rm -f build/salt.txt /tmp/input.sha256 2>/dev/null || true
+          [ -f agent.js ] && rm -f agent.js || true

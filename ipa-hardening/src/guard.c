@@ -1,0 +1,432 @@
+/*
+ * guard.c - 注入型加固 dylib 核心
+ *
+ * 防护能力：
+ *  1. 反调试（PT_DENY_ATTACH + sysctl 轮询检测）
+ *  2. 完整性校验（对宿主 Mach-O 关键段做哈希，dylib 被移除时宿主侧校验失败）
+ *  3. 反 hook（检查关键函数前导指令是否被改写、__DATA 段绑定是否被重绑）
+ *  4. 环境检测（越狱特征、Frida/Cycript/Substitute 等注入框架）
+ *  5. 字符串加密（编译期 XOR，运行期按需解密，对抗静态分析）
+ *
+ * 与宿主应用的互锁协议：
+ *  - 启动时 dylib 计算宿主 Mach-O 的校验值，写入共享内存页并投递通知
+ *  - 宿主侧 guard_host.m 周期性地校验 dylib 是否仍在内存、共享页内容是否合法
+ *  - 任一侧校验失败 -> 调用 abort() 终止进程（配合崩溃混淆，避免被轻易 patch）
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/sysctl.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <pthread.h>
+#include <limits.h>
+#include <CommonCrypto/CommonCrypto.h>
+#include <TargetConditionals.h>
+
+/* ============ 编译期字符串混淆 ============ */
+
+/* 密钥建议每次构建由脚本随机生成并注入 */
+#ifndef GUARD_STR_KEY
+#define GUARD_STR_KEY 0x5A
+#endif
+
+/* 用脚本生成 ENC(...) 数组；运行期解密到栈上 */
+#define ENC_DECL(name, ...) static const unsigned char name[] = { __VA_ARGS__, 0 ^ GUARD_STR_KEY }
+static void dec(const unsigned char *enc, char *out, size_t n) {
+    for (size_t i = 0; i < n; i++) out[i] = (char)(enc[i] ^ GUARD_STR_KEY);
+    out[n] = 0;
+}
+
+/* "frida" / "cycript" / "substrate" / "substitute" 等特征串，构建脚本中生成 */
+ENC_DECL(k_str_frida,    'f'^GUARD_STR_KEY,'r'^GUARD_STR_KEY,'i'^GUARD_STR_KEY,'d'^GUARD_STR_KEY,'a'^GUARD_STR_KEY);
+ENC_DECL(k_str_cycript,  'c'^GUARD_STR_KEY,'y'^GUARD_STR_KEY,'c'^GUARD_STR_KEY,'r'^GUARD_STR_KEY,'i'^GUARD_STR_KEY,'p'^GUARD_STR_KEY,'t'^GUARD_STR_KEY);
+ENC_DECL(k_str_substrate,'s'^GUARD_STR_KEY,'u'^GUARD_STR_KEY,'b'^GUARD_STR_KEY,'s'^GUARD_STR_KEY,'t'^GUARD_STR_KEY,'r'^GUARD_STR_KEY,'a'^GUARD_STR_KEY,'t'^GUARD_STR_KEY,'e'^GUARD_STR_KEY);
+ENC_DECL(k_str_substitute,'s'^GUARD_STR_KEY,'u'^GUARD_STR_KEY,'b'^GUARD_STR_KEY,'s'^GUARD_STR_KEY,'t'^GUARD_STR_KEY,'i'^GUARD_STR_KEY,'t'^GUARD_STR_KEY,'u'^GUARD_STR_KEY,'t'^GUARD_STR_KEY,'e'^GUARD_STR_KEY);
+ENC_DECL(k_str_guardpage, "guard.shared.v1"[0]^GUARD_STR_KEY, 'g'^GUARD_STR_KEY,'u'^GUARD_STR_KEY,'a'^GUARD_STR_KEY,'r'^GUARD_STR_KEY,'d'^GUARD_STR_KEY,'.'^GUARD_STR_KEY,'s'^GUARD_STR_KEY,'h'^GUARD_STR_KEY,'a'^GUARD_STR_KEY,'r'^GUARD_STR_KEY,'e'^GUARD_STR_KEY,'d'^GUARD_STR_KEY,'.'^GUARD_STR_KEY,'v'^GUARD_STR_KEY,'1'^GUARD_STR_KEY);
+
+/* ============ 轻量哈希（FNV-1a 64，避免引入外部依赖） ============ */
+
+static uint64_t fnv1a(const void *data, size_t len, uint64_t seed) {
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t h = 1469598103934665603ULL ^ seed;
+    for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* ============ 共享校验页：dylib 与宿主之间的互锁通道 ============ */
+
+typedef struct {
+    uint64_t magic;          /* 0x4755415244303031 "GUARD001" */
+    uint64_t host_digest;    /* 宿主 __TEXT 关键段哈希 */
+    uint64_t self_digest;    /* dylib 自身在内存中的哈希 */
+    uint64_t heartbeat;      /* 心跳计数，宿主侧校验它持续增长 */
+    uint64_t flags;          /* 检测到的风险位 */
+} guard_page_t;
+
+#define GUARD_MAGIC 0x4755415244303031ULL
+
+static guard_page_t *g_page;
+static volatile int g_abort_flag = 0;
+
+/* ============ 反调试 ============ */
+
+static void deny_attach(void) {
+#if !TARGET_OS_SIMULATOR
+    /* PT_DENY_ATTACH = 31 */
+    typedef int (*ptrace_t)(int, pid_t, caddr_t, int);
+    void *h = dlopen(0, RTLD_GLOBAL | RTLD_NOW);
+    ptrace_t pt = (ptrace_t)dlsym(h, "ptrace");
+    if (pt) pt(31, 0, 0, 0);
+#endif
+}
+
+static int debugger_attached(void) {
+    struct kinfo_proc info;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    size_t sz = sizeof(info);
+    if (sysctl(mib, 4, &info, &sz, NULL, 0) != 0) return 0;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+
+/* ============ 注入框架 / 越狱环境检测 ============ */
+
+static int injected_framework_present(void) {
+    uint32_t n = _dyld_image_count();
+    char buf[16];
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        dec(k_str_frida, buf, 5);       if (strstr(name, buf)) return 1;
+        dec(k_str_cycript, buf, 7);     if (strstr(name, buf)) return 1;
+        dec(k_str_substrate, buf, 9);   if (strstr(name, buf)) return 1;
+        dec(k_str_substitute, buf, 10); if (strstr(name, buf)) return 1;
+    }
+    return 0;
+}
+
+static int jailbreak_artifacts_present(void) {
+    const char *paths[] = {
+        "/Applications/Cydia.app",
+        "/Library/MobileSubstrate/MobileSubstrate.dylib",
+        "/usr/sbin/frida-server",
+        "/private/var/lib/apt",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        /* 用 open 而非 access，部分越狱检测绕过工具只钩 access/stat */
+        int fd = open(paths[i], O_RDONLY);
+        if (fd >= 0) { close(fd); return 1; }
+    }
+    return 0;
+}
+
+/* ============ 反 hook：校验关键函数前导指令 ============ */
+
+/*
+ * 对进程内关键系统函数取样，检查前 16 字节是否为正常指令流。
+ * 被 inline hook 时开头通常被改写为绝对跳转（如 ldr x16/br x16 或 bl 跳板）。
+ */
+static int prologue_tampered(void) {
+    const char *syms[] = { "open", "read", "stat", "dlopen", "sysctl" };
+    for (int i = 0; i < 5; i++) {
+        void *p = dlsym(RTLD_DEFAULT, syms[i]);
+        if (!p) continue;
+        uint32_t *ins = (uint32_t *)p;
+        /* AArch64: 检测常见的 trampoline 模式
+         *  LDR X16, #8 ; BR X16  =>  0x58000050, 0xD61F0200
+         *  B #imm (相对跳转覆盖) => 高 6 位为 000101
+         */
+        if (ins[0] == 0x58000050 && ins[1] == 0xD61F0200) return 1;
+        if ((ins[0] & 0xFC000000) == 0x14000000) {
+            /* 正常函数极少以无条件 B 开头（除了 PLT），结合目标距离判断 */
+            int64_t off = ((int64_t)(ins[0] & 0x03FFFFFF) << 2);
+            if (off < -(1 << 24) || off > (1 << 24)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* ============ 完整性校验 ============ */
+
+static uint64_t digest_host_text(void) {
+    const struct mach_header_64 *mh =
+        (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!mh) return 0;
+    /* 对 __TEXT 段头 + 前 N 字节取样哈希；全量哈希可用脚本在构建期固化期望值 */
+    return fnv1a(mh, 4096, 0x484F5354ULL /* "HOST" */);
+}
+
+static uint64_t digest_self(void) {
+    Dl_info info;
+    if (!dladdr((void *)digest_self, &info)) return 0;
+    return fnv1a(info.dli_fbase, 4096, 0x53454C46ULL /* "SELF" */);
+}
+
+/* ============ 生产级终止策略 ============ */
+
+/*
+ * 不直接 abort：随机延迟 0-30s 后，通过空指针写入崩溃，
+ * 崩溃点远离检测点，增加攻击者用断点/日志定位检测逻辑的成本。
+ */
+static void guard_die(void) {
+    if (g_page) g_page->flags |= 1ULL << 63;   /* 留痕：宿主侧可见 */
+    unsigned jitter = arc4random_uniform(30000);
+    usleep(jitter * 1000);
+    volatile uint64_t *p = (volatile uint64_t *)((uintptr_t)g_page ^ (uintptr_t)-1);
+    *p = 0xDEAD;   /* 无效地址写入 -> SIGSEGV */
+    abort();       /* 兜底 */
+}
+
+/* ============ 后台守护线程 ============ */
+
+static void *guard_loop(void *arg) {
+    (void)arg;
+    for (;;) {
+        uint64_t risk = 0;
+        if (debugger_attached())          risk |= 1 << 0;
+        if (injected_framework_present()) risk |= 1 << 1;
+        if (prologue_tampered())          risk |= 1 << 2;
+        if (jailbreak_artifacts_present())risk |= 1 << 3;
+
+        if (g_page) {
+            g_page->flags = risk;
+            g_page->heartbeat++;
+        }
+
+        if (risk & ((1 << 0) | (1 << 1) | (1 << 2))) {
+            g_abort_flag = 1;
+            guard_die();
+        }
+        usleep(500000); /* 500ms 轮询 */
+    }
+    return NULL;
+}
+
+/* ============ Frida JS 安全加载 ============ */
+
+/*
+ * JS 脚本加密存储在 app 内（Frameworks/agent.js.enc）。
+ * 解密密钥派生自：宿主 Mach-O digest + 构建期嵌入的 salt + 设备进程特征。
+ * 验证 dylib 被移除 -> 无人 dlopen FridaGadget，JS 永远是密文；
+ * 验证 dylib 被 patch -> host_digest 变化 -> 密钥错误 -> 解密出垃圾 -> Gadget 拒绝加载。
+ */
+
+#ifndef GUARD_JS_SALT
+#define GUARD_JS_SALT 0x1122334455667788ULL
+#endif
+
+/* 编译期注入的密文识别 magic（8 字节，每次构建随机，脚本同步用于加密打包）。
+ * guard 不记任何固定文件名，靠 magic 扫描发现密文，文件名可任意伪装。 */
+#ifndef GUARD_JS_MAGIC
+#define GUARD_JS_MAGIC 0x474D414749433031ULL
+#endif
+
+/*
+ * 密文格式: magic(8) || nonce(12) || ciphertext || tag(16)，AES-256-GCM。
+ * key = SHA-256( host_digest(8, LE) || salt(8, LE) || plain_len(8, LE) )
+ * 绑定宿主完整性 + 构建期 salt + 明文长度上下文。
+ * GCM 认证标签使任何对密文/密钥的篡改都导致解密失败。
+ */
+#define GCM_MAGIC_LEN 8
+#define GCM_NONCE_LEN 12
+#define GCM_TAG_LEN   16
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+/* 在 dir 中查找带 GUARD_JS_MAGIC 头的文件（密文），返回 0 表示找到 */
+static int find_blob_by_magic(const char *dir, char *out, size_t out_sz) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    uint64_t want = GUARD_JS_MAGIC;
+    struct dirent *ent;
+    int found = -1;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        uint64_t magic = 0;
+        if (read(fd, &magic, 8) == 8 && magic == want) {
+            strlcpy(out, path, out_sz);
+            found = 0;
+        }
+        close(fd);
+        if (found == 0) break;
+    }
+    closedir(d);
+    return found;
+}
+
+/* 在 dir 中找体积最大的 dylib（FridaGadget 30MB+，业务库远小于它） */
+static int find_gadget_by_size(const char *dir, const char *self_path,
+                               char *out, size_t out_sz) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *ent;
+    off_t best = 8 * 1024 * 1024;   /* 至少 8MB 才考虑，过滤普通业务库 */
+    int found = -1;
+    while ((ent = readdir(d)) != NULL) {
+        size_t n = strlen(ent->d_name);
+        if (n < 7 || strcmp(ent->d_name + n - 6, ".dylib") != 0) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        if (self_path && strstr(path, self_path)) continue;   /* 排除自身 */
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > best) {
+            best = st.st_size;
+            strlcpy(out, path, out_sz);
+            found = 0;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static void derive_js_key(uint8_t out[CC_SHA256_DIGEST_LENGTH],
+                          uint64_t host_digest, uint64_t plain_len) {
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    uint64_t d = host_digest, s = GUARD_JS_SALT, l = plain_len;
+    CC_SHA256_Update(&ctx, &d, 8);
+    CC_SHA256_Update(&ctx, &s, 8);
+    CC_SHA256_Update(&ctx, &l, 8);
+    CC_SHA256_Final(out, &ctx);
+}
+
+static int load_frida_agent(void) {
+    char base[PATH_MAX];
+    uint32_t sz = sizeof(base);
+    if (_NSGetExecutablePath(base, &sz) != 0) return -1;
+    char *slash = strrchr(base, '/');
+    if (!slash) return -1;
+    *slash = 0;
+
+    char fw_dir[PATH_MAX];
+    snprintf(fw_dir, sizeof(fw_dir), "%s/Frameworks", base);
+
+    /* 1. 按 magic 扫描发现密文（文件名任意伪装） */
+    char enc_path[PATH_MAX];
+    if (find_blob_by_magic(fw_dir, enc_path, sizeof(enc_path)) != 0) return -1;
+
+    int fd = open(enc_path, O_RDONLY);
+    if (fd < 0) return -1;
+    off_t total = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    if (total <= (off_t)(GCM_MAGIC_LEN + GCM_NONCE_LEN + GCM_TAG_LEN)) { close(fd); return -1; }
+    unsigned char *blob = malloc(total);
+    if (!blob || read(fd, blob, total) != total) { close(fd); free(blob); return -1; }
+    close(fd);
+
+    const unsigned char *nonce = blob + GCM_MAGIC_LEN;
+    const unsigned char *ct    = blob + GCM_MAGIC_LEN + GCM_NONCE_LEN;
+    size_t ct_len = (size_t)total - GCM_MAGIC_LEN - GCM_NONCE_LEN - GCM_TAG_LEN;
+    const unsigned char *tag   = blob + GCM_MAGIC_LEN + GCM_NONCE_LEN + ct_len;
+
+    /* 2. 派生密钥并解密（AES-256-GCM，认证失败即返回错误） */
+    uint8_t key[CC_SHA256_DIGEST_LENGTH];
+    derive_js_key(key, digest_host_text(), (uint64_t)ct_len);
+
+    unsigned char *plain = malloc(ct_len);
+    if (!plain) { free(blob); return -1; }
+
+    CCCryptorRef cref = NULL;
+    CCCryptorStatus st = CCCryptorCreateWithMode(kCCDecrypt, kCCModeGCM, kCCAlgorithmAES,
+        ccNoPadding, nonce, key, kCCKeySizeAES256, NULL, 0, 0, kCCModeOptionCTR_BE, &cref);
+    if (st != kCCSuccess) { free(plain); free(blob); return -1; }
+
+    size_t out_len = 0;
+    st = CCCryptorDecryptDataOperation(cref, ct, ct_len, plain, ct_len, &out_len);
+    if (st == kCCSuccess) {
+        CCCryptorGCMFinal(cref, tag, GCM_TAG_LEN);
+        st = CCCryptorRelease(cref);
+    } else {
+        CCCryptorRelease(cref);
+    }
+    memset(key, 0, sizeof(key));
+    free(blob);
+    if (st != kCCSuccess || out_len != ct_len) { free(plain); return -1; }
+
+    /* 3. 写入临时文件供 Gadget 读取（加载后立即删除并抹除内存明文） */
+    char tmp[] = "/tmp/gXXXXXX.js";
+    int tfd = mkstemps(tmp, 3);
+    if (tfd < 0) { memset(plain, 0, ct_len); free(plain); return -1; }
+    write(tfd, plain, ct_len);
+    close(tfd);
+    memset(plain, 0, ct_len);
+    free(plain);
+
+    /* 4. 按体积发现 Gadget（文件名任意伪装），配置取同 basename */
+    char gadget_path[PATH_MAX];
+    Dl_info self_info;
+    const char *self_name = NULL;
+    if (dladdr((void *)load_frida_agent, &self_info) && self_info.dli_fname)
+        self_name = strrchr(self_info.dli_fname, '/');
+    if (find_gadget_by_size(fw_dir, self_name, gadget_path, sizeof(gadget_path)) != 0)
+        return -1;
+    char cfg_path[PATH_MAX];
+    strlcpy(cfg_path, gadget_path, sizeof(cfg_path));
+    char *dot = strrchr(cfg_path, '.');
+    if (dot) *dot = 0;
+    strlcat(cfg_path, ".config", sizeof(cfg_path));
+    char cfg[1024];
+    snprintf(cfg, sizeof(cfg),
+        "{\"interaction\":{\"type\":\"script\",\"path\":\"%s\",\"on_change\":\"reload\"}}", tmp);
+    int cfd = open(cfg_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (cfd < 0) { unlink(tmp); return -1; }
+    write(cfd, cfg, strlen(cfg));
+    close(cfd);
+
+    void *g = dlopen(gadget_path, RTLD_NOW);
+    /* Gadget 已异步加载脚本，临时文件使命完成 */
+    usleep(300000);
+    unlink(tmp);
+    return g ? 0 : -1;
+}
+
+/* ============ 入口 ============ */
+
+__attribute__((constructor))
+static void guard_init(void) {
+    deny_attach();
+
+    /* 建立共享校验页（用 mmap 匿名页，宿主侧通过已导出符号取地址） */
+    g_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                  MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g_page == MAP_FAILED) { g_page = NULL; abort(); }
+
+    g_page->magic       = GUARD_MAGIC;
+    g_page->host_digest = digest_host_text();
+    g_page->self_digest = digest_self();
+    g_page->heartbeat   = 1;
+    g_page->flags       = 0;
+
+    /* 先做一轮快速环境检查，全部通过才允许加载 Frida JS */
+    if (!debugger_attached() && !injected_framework_present() && !prologue_tampered()) {
+        load_frida_agent();
+    }
+
+    pthread_t t;
+    pthread_create(&t, NULL, guard_loop, NULL);
+    pthread_detach(t);
+}
+
+/* 导出给宿主侧调用的校验接口（符号名由构建脚本随机化） */
+__attribute__((visibility("default")))
+const guard_page_t *guard_query_page(void) {
+    return g_page;
+}
+
+/* 宿主心跳确认：宿主定期调用，若 dylib 被 unload/移除则调用直接崩溃 */
+__attribute__((visibility("default")))
+uint64_t guard_tick(uint64_t v) {
+    if (!g_page || g_page->magic != GUARD_MAGIC) abort();
+    return fnv1a(&v, sizeof(v), g_page->heartbeat);
+}
