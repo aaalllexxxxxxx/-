@@ -176,7 +176,7 @@ Actions → "IPA Hardening" → Run workflow：
 | 服务端拒绝（禁用/解绑/验签失败） | 已加载的 JS 随进程终止（`guard_request_die`） |
 | 卡密逻辑被 patch 移除 | guard 反 hook 检测命中，随机延迟崩溃 |
 
-**必做配置**：编辑 `src/auth/Config.h`，填入 `AUTH_SERVER_URL`（你的卡密后台地址）和面板标题，否则验证无法工作。
+**配置**：`src/auth/Config.h` 已包含后台地址（`AUTH_SERVER_URL`）、面板标题、心跳间隔、离线宽限，开箱即用；仅当后台地址变更时才需要修改。
 
 ### 生产级安全设计
 
