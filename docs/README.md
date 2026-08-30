@@ -164,6 +164,17 @@ Actions → "IPA Hardening" → Run workflow：
 
 **自定义伪装名**：编辑仓库根目录 `camouflage.conf`，建议参考你 App 内已有库的命名风格，避免 crypto/guard/frida/agent 等敏感词。
 
+### 卡密验证整合（card_auth.m）
+
+`src/card_auth.m` 存在时，构建脚本自动把它与 `guard.c` 合并编译为**单一 dylib**，利用 constructor 优先级实现联动：
+
+1. `card_auth` 用 `constructor(101)`（最高优先级）先执行卡密校验
+2. 校验失败/到期/时间篡改 → `exit(0)` 进程终止，`guard` 的 constructor 不会执行，JS 永不加载
+3. 校验通过 → `guard` 执行反调试/反 hook，全部通过后解密加载 JS
+4. 卡密校验被 patch 绕过 → `guard` 的反 hook 检测命中，随机延迟崩溃
+
+**注意**：`card_auth.m` 顶部的 `g_card_key` 是占位密钥（0x11...0x10），必须替换为与你 `gen_card.py` 发卡脚本一致的真实 32 字节密钥，否则所有卡密都校验失败。
+
 ### 生产级安全设计
 
 **JS 加密（AES-256-GCM）**

@@ -13,19 +13,30 @@ echo "$SALT" > "$OUT_DIR/salt.txt"
 echo "$MAGIC" > "$OUT_DIR/magic.txt"
 echo "[*] guard string key: $KEY, js salt: $SALT, js magic: $MAGIC"
 
+# 若存在 src/card_auth.m，与 guard.c 合并编译为单一 dylib：
+# card_auth constructor(101) 先执行卡密校验，失败 exit(0)，guard 的 JS 加载不会执行
+SRCS="src/guard.c"
+EXTRA_FRAMEWORKS=""
+if [ -f src/card_auth.m ]; then
+  echo "[*] card_auth.m detected, merging into single dylib"
+  SRCS="$SRCS src/card_auth.m"
+  EXTRA_FRAMEWORKS="-framework UIKit -framework Security"
+fi
+
 for ARCH in arm64; do
   xcrun -sdk iphoneos clang \
     -arch $ARCH \
     -dynamiclib \
     -install_name "@executable_path/Frameworks/libguard.dylib" \
     -framework Foundation \
+    $EXTRA_FRAMEWORKS \
     -fvisibility=hidden \
     -O2 \
     -DGUARD_STR_KEY=$KEY \
     -DGUARD_JS_SALT=${SALT}ULL \
     -DGUARD_JS_MAGIC=${MAGIC}ULL \
     -mios-version-min=12.0 \
-    src/guard.c \
+    $SRCS \
     -o "$OUT_DIR/libguard_$ARCH.dylib"
 done
 
