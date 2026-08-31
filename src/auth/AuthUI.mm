@@ -24,6 +24,29 @@ static UIColor *AuthUIGreenColor(void) {
     return [UIColor colorWithRed:0.2 green:0.65 blue:0.25 alpha:1];
 }
 
+// 到期时间展示:v4.3 ISO 8601 UTC("2026-09-29T10:29:29Z")与旧格式("2026-09-29 10:29:29")
+// 均按 UTC 解析后换算设备本地时区显示,任意时区设备看到的都是正确的本地到期时刻
+static NSString *FormatExpiryLocal(NSString *raw) {
+    if (![raw isKindOfClass:[NSString class]] || raw.length < 19) return @"";
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    NSDate *date = nil;
+    if ([raw containsString:@"T"]) {
+        fmt.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
+        date = [fmt dateFromString:raw];
+    }
+    if (!date) {
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        date = [fmt dateFromString:raw];
+    }
+    if (!date) return raw; // 未知格式原样透出
+    NSDateFormatter *out = [[NSDateFormatter alloc] init];
+    out.dateFormat = @"yyyy-MM-dd HH:mm";
+    out.timeZone = [NSTimeZone systemTimeZone];
+    return [out stringFromDate:date];
+}
+
 @interface AuthPanelViewController : UIViewController <UITextFieldDelegate>
 @property (nonatomic, strong) UIView *card;
 @property (nonatomic, strong) UITextField *cardField;
@@ -162,10 +185,8 @@ static UIColor *AuthUIGreenColor(void) {
             self.cardField.enabled = NO;
             self.verifyButton.enabled = NO;
             self.verifyButton.alpha = 0.5;
-            // expires_at 格式 "YYYY-MM-DD HH:MM:SS",取日期部分展示
-            NSString *date = [info[@"expires_at"] isKindOfClass:[NSString class]]
-                ? info[@"expires_at"] : @"";
-            date = date.length >= 10 ? [date substringToIndex:10] : date;
+            // 到期时间按设备本地时区展示(服务端 v4.3 起为 UTC ISO 格式)
+            NSString *date = FormatExpiryLocal(info[@"expires_at"]);
             NSString *done = date.length > 0
                 ? [NSString stringWithFormat:@"激活成功,有效期至 %@", date]
                 : @"激活成功";
