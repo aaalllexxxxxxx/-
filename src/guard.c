@@ -15,6 +15,7 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -309,6 +310,88 @@ static void derive_js_key(uint8_t out[CC_SHA256_DIGEST_LENGTH],
     CC_SHA256_Final(out, &ctx);
 }
 
+/* ===== 手写 AES-256-GCM 解密（NIST SP 800-38D）=====
+ * iOS SDK 公开 CommonCrypto 头文件未导出 GCM 接口（kCCModeGCM 等），
+ * 故按标准手写：AES-ECB 单块 + CTR 异或 + GHASH 认证。
+ * 与 embed_js.sh 中 Python cryptography 的 AESGCM（格式 nonce||ct||tag）互通。 */
+
+/* AES-256 单块 ECB 加密（公开 API，GCM 构件） */
+static void aes_ecb_encrypt_block(const uint8_t key[kCCKeySizeAES256],
+                                  const uint8_t in[16], uint8_t out[16]) {
+    size_t moved = 0;
+    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode,
+            key, kCCKeySizeAES256, NULL, in, kCCBlockSizeAES128,
+            out, kCCBlockSizeAES128, &moved);
+}
+
+/* GF(2^128) 乘法（MSB-first），结果覆盖 X */
+static void gf128_mul(uint8_t X[16], const uint8_t H[16]) {
+    uint8_t Z[16] = {0}, V[16];
+    memcpy(V, H, 16);
+    for (int i = 0; i < 16; i++) {
+        for (int b = 7; b >= 0; b--) {
+            if ((X[i] >> b) & 1)
+                for (int k = 0; k < 16; k++) Z[k] ^= V[k];
+            uint8_t lsb = V[15] & 1;
+            for (int k = 15; k > 0; k--)
+                V[k] = (uint8_t)((V[k] >> 1) | (V[k - 1] << 7));
+            V[0] >>= 1;
+            if (lsb) V[0] ^= 0xE1;
+        }
+    }
+    memcpy(X, Z, 16);
+}
+
+/* GCM 解密：in 格式 nonce(12) || ct || tag(16)，空 AAD。
+ * 认证失败返回 -1，成功返回 0，明文写入 plain（长度 = ct_len）。 */
+static int gcm_decrypt(const uint8_t key[kCCKeySizeAES256],
+                       const uint8_t *nonce_ct_tag, size_t total_len,
+                       unsigned char *plain) {
+    if (total_len <= GCM_NONCE_LEN + GCM_TAG_LEN) return -1;
+    size_t ct_len = total_len - GCM_NONCE_LEN - GCM_TAG_LEN;
+    const uint8_t *nonce = nonce_ct_tag;
+    const uint8_t *ct    = nonce_ct_tag + GCM_NONCE_LEN;
+    const uint8_t *tag   = nonce_ct_tag + GCM_NONCE_LEN + ct_len;
+
+    uint8_t H[16], J0[16];
+    static const uint8_t zero16[16] = {0};
+    aes_ecb_encrypt_block(key, zero16, H);
+    memcpy(J0, nonce, 12);
+    J0[12] = 0; J0[13] = 0; J0[14] = 0; J0[15] = 1;
+
+    /* CTR：计数器从 inc32(J0) 起 */
+    uint8_t ctr[16];
+    memcpy(ctr, J0, 16);
+    for (size_t off = 0; off < ct_len; off += 16) {
+        for (int i = 15; i >= 12; i--) { if (++ctr[i]) break; }
+        uint8_t ks[16];
+        aes_ecb_encrypt_block(key, ctr, ks);
+        size_t n = ct_len - off < 16 ? ct_len - off : 16;
+        for (size_t i = 0; i < n; i++) plain[off + i] = ct[off + i] ^ ks[i];
+    }
+
+    /* GHASH（空 AAD || ct || 长度块） */
+    uint8_t Y[16] = {0}, blk[16];
+    for (size_t off = 0; off < ct_len; off += 16) {
+        memset(blk, 0, 16);
+        size_t n = ct_len - off < 16 ? ct_len - off : 16;
+        memcpy(blk, ct + off, n);
+        for (int i = 0; i < 16; i++) Y[i] ^= blk[i];
+        gf128_mul(Y, H);
+    }
+    memset(blk, 0, 16);  /* AAD bitlen = 0 */
+    uint64_t ctBits = (uint64_t)ct_len * 8;
+    for (int i = 0; i < 8; i++) blk[8 + i] = (uint8_t)(ctBits >> ((7 - i) * 8));
+    for (int i = 0; i < 16; i++) Y[i] ^= blk[i];
+    gf128_mul(Y, H);
+
+    /* tag = E_K(J0) XOR GHASH */
+    uint8_t expect[16];
+    aes_ecb_encrypt_block(key, J0, expect);
+    for (int i = 0; i < 16; i++) expect[i] ^= Y[i];
+    return memcmp(expect, tag, 16) == 0 ? 0 : -1;
+}
+
 /* 导出给 guard_bridge.mm 调用（卡密联动）；独立使用时由 constructor 直接调用 */
 __attribute__((visibility("default")))
 int guard_load_frida_agent(void) {
@@ -347,22 +430,14 @@ int guard_load_frida_agent(void) {
     unsigned char *plain = malloc(ct_len);
     if (!plain) { free(blob); return -1; }
 
-    CCCryptorRef cref = NULL;
-    CCCryptorStatus st = CCCryptorCreateWithMode(kCCDecrypt, kCCModeGCM, kCCAlgorithmAES,
-        ccNoPadding, nonce, key, kCCKeySizeAES256, NULL, 0, 0, kCCModeOptionCTR_BE, &cref);
-    if (st != kCCSuccess) { free(plain); free(blob); return -1; }
-
-    size_t out_len = 0;
-    st = CCCryptorDecryptDataOperation(cref, ct, ct_len, plain, ct_len, &out_len);
-    if (st == kCCSuccess) {
-        CCCryptorGCMFinal(cref, tag, GCM_TAG_LEN);
-        st = CCCryptorRelease(cref);
-    } else {
-        CCCryptorRelease(cref);
+    if (gcm_decrypt(key, nonce, GCM_NONCE_LEN + ct_len + GCM_TAG_LEN, plain) != 0) {
+        memset(key, 0, sizeof(key));
+        free(plain);
+        free(blob);
+        return -1;
     }
     memset(key, 0, sizeof(key));
     free(blob);
-    if (st != kCCSuccess || out_len != ct_len) { free(plain); return -1; }
 
     /* 3. 写入临时文件供 Gadget 读取（加载后立即删除并抹除内存明文） */
     char tmp[] = "/tmp/gXXXXXX.js";
