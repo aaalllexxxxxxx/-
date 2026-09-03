@@ -194,6 +194,11 @@ static void guard_die(void) {
 
 /* ============ 后台守护线程 ============ */
 
+/* 解密后的 JS 明文临时文件路径（延迟清理，见 guard_loop） */
+static char g_tmp_js_path[PATH_MAX];
+static volatile int g_tmp_js_pending = 0;
+static unsigned g_tmp_js_ticks = 0;
+
 static void *guard_loop(void *arg) {
     (void)arg;
     for (;;) {
@@ -211,6 +216,14 @@ static void *guard_loop(void *arg) {
         if (risk & ((1 << 0) | (1 << 1) | (1 << 2))) {
             g_abort_flag = 1;
             guard_die();
+        }
+
+        /* 延迟清理 JS 明文：Gadget 异步加载脚本需数秒，
+         * 立即删除会导致脚本读不到/读取中断，这里 60s 后再删 */
+        if (g_tmp_js_pending && ++g_tmp_js_ticks >= 120) {
+            g_tmp_js_ticks = 0;
+            g_tmp_js_pending = 0;
+            unlink(g_tmp_js_path);
         }
         usleep(500000); /* 500ms 轮询 */
     }
@@ -439,12 +452,20 @@ int guard_load_frida_agent(void) {
     memset(key, 0, sizeof(key));
     free(blob);
 
-    /* 3. 写入临时文件供 Gadget 读取（加载后立即删除并抹除内存明文） */
-    char tmp[] = "/tmp/gXXXXXX.js";
+    /* 3. 写入临时文件供 Gadget 读取（沙盒私有 TMPDIR，延迟清理见 guard_loop） */
+    char tmp[PATH_MAX];
+    const char *td = getenv("TMPDIR");
+    snprintf(tmp, sizeof(tmp), "%s/gXXXXXX.js", td ? td : "/tmp");
     int tfd = mkstemps(tmp, 3);
     if (tfd < 0) { memset(plain, 0, ct_len); free(plain); return -1; }
-    write(tfd, plain, ct_len);
+    size_t off = 0;
+    while (off < ct_len) {
+        ssize_t n = write(tfd, plain + off, ct_len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
     close(tfd);
+    if (off != ct_len) { memset(plain, 0, ct_len); free(plain); unlink(tmp); return -1; }
     memset(plain, 0, ct_len);
     free(plain);
 
@@ -454,26 +475,32 @@ int guard_load_frida_agent(void) {
     const char *self_name = NULL;
     if (dladdr((void *)guard_load_frida_agent, &self_info) && self_info.dli_fname)
         self_name = strrchr(self_info.dli_fname, '/');
-    if (find_gadget_by_size(fw_dir, self_name, gadget_path, sizeof(gadget_path)) != 0)
+    if (find_gadget_by_size(fw_dir, self_name, gadget_path, sizeof(gadget_path)) != 0) {
+        unlink(tmp);
         return -1;
+    }
     char cfg_path[PATH_MAX];
     strlcpy(cfg_path, gadget_path, sizeof(cfg_path));
     char *dot = strrchr(cfg_path, '.');
     if (dot) *dot = 0;
     strlcat(cfg_path, ".config", sizeof(cfg_path));
+    /* on_change=ignore：只加载一次，不监听文件变化，
+     * 否则临时文件被延迟清理时会触发 reload 导致脚本卸载 */
     char cfg[1024];
     snprintf(cfg, sizeof(cfg),
-        "{\"interaction\":{\"type\":\"script\",\"path\":\"%s\",\"on_change\":\"reload\"}}", tmp);
+        "{\"interaction\":{\"type\":\"script\",\"path\":\"%s\",\"on_change\":\"ignore\"}}", tmp);
     int cfd = open(cfg_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (cfd < 0) { unlink(tmp); return -1; }
     write(cfd, cfg, strlen(cfg));
     close(cfd);
 
     void *g = dlopen(gadget_path, RTLD_NOW);
-    /* Gadget 已异步加载脚本，临时文件使命完成 */
-    usleep(300000);
-    unlink(tmp);
-    return g ? 0 : -1;
+    if (!g) { unlink(tmp); return -1; }
+    /* Gadget 异步加载脚本，明文临时文件交由 guard_loop 60s 后清理 */
+    strlcpy(g_tmp_js_path, tmp, sizeof(g_tmp_js_path));
+    g_tmp_js_pending = 1;
+    g_tmp_js_ticks = 0;
+    return 0;
 }
 
 /* ============ 入口 ============ */
