@@ -53,7 +53,9 @@ jobs:
           else
             FOUND=$(find . -name "*.ipa" -not -path "./.*" | head -1)
             [ -n "$FOUND" ] || { echo "::error::no ipa found (push a .ipa or provide ipa_url)"; exit 1; }
-            cp "$FOUND" app.ipa
+            if [ "$FOUND" != "./app.ipa" ] && [ "$FOUND" != "app.ipa" ]; then
+              cp "$FOUND" app.ipa
+            fi
           fi
           shasum -a 256 app.ipa | tee /tmp/input.sha256
 
