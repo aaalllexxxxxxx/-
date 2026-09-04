@@ -469,7 +469,7 @@ int guard_load_frida_agent(void) {
     memset(plain, 0, ct_len);
     free(plain);
 
-    /* 4. 按体积发现 Gadget（文件名任意伪装），配置取同 basename */
+    /* 4. 按体积发现 Gadget（文件名任意伪装）；config 写到沙盒 TMPDIR，避免写只读 bundle */
     char gadget_path[PATH_MAX];
     Dl_info self_info;
     const char *self_name = NULL;
@@ -479,16 +479,28 @@ int guard_load_frida_agent(void) {
         unlink(tmp);
         return -1;
     }
+    /* 把 .config 也落到沙盒 TMPDIR，避免写 app bundle（iOS 已安装 app 的 Frameworks/ 是只读的） */
     char cfg_path[PATH_MAX];
-    strlcpy(cfg_path, gadget_path, sizeof(cfg_path));
-    char *dot = strrchr(cfg_path, '.');
-    if (dot) *dot = 0;
-    strlcat(cfg_path, ".config", sizeof(cfg_path));
+    {
+        const char *td = getenv("TMPDIR");
+        strlcpy(cfg_path, td ? td : "/tmp", sizeof(cfg_path));
+        strlcat(cfg_path, "/gXXXXXX.config", sizeof(cfg_path));
+        int cfd = mkstemps(cfg_path, 7);
+        if (cfd < 0) { unlink(tmp); return -1; }
+        close(cfd);
+    }
     /* on_change=ignore：只加载一次，不监听文件变化，
      * 否则临时文件被延迟清理时会触发 reload 导致脚本卸载 */
     char cfg[1024];
     snprintf(cfg, sizeof(cfg),
         "{\"interaction\":{\"type\":\"script\",\"path\":\"%s\",\"on_change\":\"ignore\"}}", tmp);
+
+    /* 用环境变量告知 Gadget config 路径，避免写入只读的 app bundle 目录 */
+    if (setenv("FRIDA_GADGET_CONFIG", cfg_path, 1) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    /* 同样把 config 本体落到沙盒 TMPDIR，供 Gadget 读取 */
     int cfd = open(cfg_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (cfd < 0) { unlink(tmp); return -1; }
     write(cfd, cfg, strlen(cfg));
