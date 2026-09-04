@@ -37,15 +37,33 @@ print(h)
 EOF
 )
 
-echo "[*] encrypting agent.js with AES-256-GCM -> $JS_BLOB_NAME"
+echo "[*] wrapping agent.js with self-decrypting loader (XOR+base64, plaintext never hits disk)"
 python3 - "$JS" "$APP_DIR/Frameworks/$JS_BLOB_NAME" "$DIGEST" "$SALT" "$MAGIC" <<'EOF'
-import sys, hashlib, os
+import sys, hashlib, os, base64
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 src, dst, digest, salt, magic = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4], 16), int(sys.argv[5], 16)
 
 with open(src, 'rb') as f:
-    plain = f.read()
+    raw = f.read()
+
+# 第一层：业务代码 XOR+base64，loader 在 JS 引擎内存里解码 eval。
+# 明文业务逻辑只存在于内存，磁盘上（config path 指向的脚本文件）只有 loader 壳。
+xor_key = os.urandom(32)
+enc = bytes(b ^ xor_key[i % len(xor_key)] for i, b in enumerate(raw))
+b64 = base64.b64encode(enc).decode()
+key_hex = xor_key.hex()
+
+loader = (
+    "const __k='" + key_hex + "';const __d='" + b64 + "';"
+    "(function(){var kb=[];for(var i=0;i<__k.length;i+=2)kb.push(parseInt(__k.substr(i,2),16));"
+    "var db=atob(__d),bs=[];for(var j=0;j<db.length;j++)bs.push(String.fromCharCode(db.charCodeAt(j)^kb[j%kb.length]));"
+    "var s=bs.join('');"
+    "try{s=decodeURIComponent(escape(s));}catch(e){}"
+    "(0,eval)(s);})();"
+)
+
+plain = loader.encode()
 
 # KDF: key = SHA-256( digest || salt || plain_len )，与 guard.c 完全一致
 key = hashlib.sha256(
@@ -61,7 +79,7 @@ ct, tag = ct_with_tag[:-16], ct_with_tag[-16:]
 # 头部写入 magic，供 guard 运行时在任意伪装文件名中识别密文
 with open(dst, 'wb') as f:
     f.write(magic.to_bytes(8, 'little') + nonce + ct + tag)
-print(f"[+] encrypted -> {dst} ({8 + 12 + len(ct) + 16} bytes)")
+print(f"[+] encrypted -> {dst} ({8 + 12 + len(ct) + 16} bytes, loader-wrapped {len(plain)} bytes)")
 EOF
 
 # 预置 Gadget config（构建期写入，运行期只读即可）。

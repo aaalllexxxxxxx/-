@@ -170,6 +170,11 @@ jobs:
               echo "::error::plaintext agent.js leaked in package"; exit 1
             fi
             echo "[ok] no plaintext js leakage"
+            # 解密验证：GCM 认证 + loader 包装 + 载荷与 agent.js 逐字节一致
+            JS_SALT=$(cat build/salt.txt); JS_MAGIC=$(cat build/magic.txt)
+            python3 scripts/verify_blob.py \
+              "$APP_DIR/Frameworks/$JS_BLOB_NAME" "$APP_DIR/$APP_NAME" \
+              agent.js "$JS_SALT" "$JS_MAGIC"
           fi
 
           # 6.4 entitlements 可 dump

@@ -218,9 +218,9 @@ static void *guard_loop(void *arg) {
             guard_die();
         }
 
-        /* 延迟清理 JS 明文：Gadget 异步加载脚本需数秒，
-         * 立即删除会导致脚本读不到/读取中断，这里 60s 后再删 */
-        if (g_tmp_js_pending && ++g_tmp_js_ticks >= 120) {
+        /* 兜底清理 JS 明文：dlopen 成功后已在主流程立即删除（Gadget constructor
+         * 阻塞至脚本 init 完成，返回时脚本已读入内存），这里仅防极端时序，3s 即删 */
+        if (g_tmp_js_pending && ++g_tmp_js_ticks >= 6) {
             g_tmp_js_ticks = 0;
             g_tmp_js_pending = 0;
             unlink(g_tmp_js_path);
@@ -514,7 +514,9 @@ int guard_load_frida_agent(void) {
 
     void *g = dlopen(gadget_path, RTLD_NOW);
     if (!g) { unlink(doc_js); return -1; }
-    /* Gadget 异步加载脚本，明文临时文件交由 guard_loop 60s 后清理 */
+    /* Gadget constructor 阻塞至脚本 init 完成（script 模式下等 init 返回才 resume），
+     * dlopen 返回即明文已无用，立即删除；guard_loop 3s 兜底防极端时序 */
+    unlink(doc_js);
     strlcpy(g_tmp_js_path, doc_js, sizeof(g_tmp_js_path));
     g_tmp_js_pending = 1;
     g_tmp_js_ticks = 0;
