@@ -452,7 +452,7 @@ int guard_load_frida_agent(void) {
     memset(key, 0, sizeof(key));
     free(blob);
 
-    /* 3. 写入临时文件供 Gadget 读取（沙盒私有 TMPDIR，延迟清理见 guard_loop） */
+    /* 3. 先解密到 TMPDIR 临时文件（rename 原子化落地用，延迟清理见 guard_loop） */
     char tmp[PATH_MAX];
     const char *td = getenv("TMPDIR");
     snprintf(tmp, sizeof(tmp), "%s/gXXXXXX.js", td ? td : "/tmp");
@@ -469,7 +469,8 @@ int guard_load_frida_agent(void) {
     memset(plain, 0, ct_len);
     free(plain);
 
-    /* 4. 按体积发现 Gadget（文件名任意伪装）；config 写到沙盒 TMPDIR，避免写只读 bundle */
+    /* 4. 发现 Gadget 并读取其嵌入 config（构建期由 embed_js.sh 预置到 Frameworks），
+     *    从中解析 script 相对路径名 —— Gadget 会在 Documents 下优先查找该名字 */
     char gadget_path[PATH_MAX];
     Dl_info self_info;
     const char *self_name = NULL;
@@ -479,37 +480,42 @@ int guard_load_frida_agent(void) {
         unlink(tmp);
         return -1;
     }
-    /* 把 .config 也落到沙盒 TMPDIR，避免写 app bundle（iOS 已安装 app 的 Frameworks/ 是只读的） */
     char cfg_path[PATH_MAX];
+    strlcpy(cfg_path, gadget_path, sizeof(cfg_path));
+    char *dot = strrchr(cfg_path, '.');
+    if (dot) *dot = 0;
+    strlcat(cfg_path, ".config", sizeof(cfg_path));
+    char cfg_data[2048];
     {
-        const char *td = getenv("TMPDIR");
-        strlcpy(cfg_path, td ? td : "/tmp", sizeof(cfg_path));
-        strlcat(cfg_path, "/gXXXXXX.config", sizeof(cfg_path));
-        int cfd = mkstemps(cfg_path, 7);
+        int cfd = open(cfg_path, O_RDONLY);
         if (cfd < 0) { unlink(tmp); return -1; }
+        ssize_t n = read(cfd, cfg_data, sizeof(cfg_data) - 1);
         close(cfd);
+        if (n <= 0) { unlink(tmp); return -1; }
+        cfg_data[n] = 0;
     }
-    /* on_change=ignore：只加载一次，不监听文件变化，
-     * 否则临时文件被延迟清理时会触发 reload 导致脚本卸载 */
-    char cfg[1024];
-    snprintf(cfg, sizeof(cfg),
-        "{\"interaction\":{\"type\":\"script\",\"path\":\"%s\",\"on_change\":\"ignore\"}}", tmp);
+    const char *pk = strstr(cfg_data, "\"path\":\"");
+    if (!pk) { unlink(tmp); return -1; }
+    pk += strlen("\"path\":\"");
+    const char *pe = strchr(pk, '"');
+    if (!pe || pe == pk || (size_t)(pe - pk) >= PATH_MAX) { unlink(tmp); return -1; }
+    char js_name[PATH_MAX];
+    memcpy(js_name, pk, (size_t)(pe - pk));
+    js_name[pe - pk] = 0;
+    if (js_name[0] == '/') { unlink(tmp); return -1; } /* 仅支持相对路径（Documents 解析） */
 
-    /* 用环境变量告知 Gadget config 路径，避免写入只读的 app bundle 目录 */
-    if (setenv("FRIDA_GADGET_CONFIG", cfg_path, 1) != 0) {
-        unlink(tmp);
-        return -1;
-    }
-    /* 同样把 config 本体落到沙盒 TMPDIR，供 Gadget 读取 */
-    int cfd = open(cfg_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (cfd < 0) { unlink(tmp); return -1; }
-    write(cfd, cfg, strlen(cfg));
-    close(cfd);
+    /* 5. 把明文 JS rename 到 Documents/<js_name>（可写沙盒目录，Gadget 相对路径优先在此查找） */
+    char doc_dir[PATH_MAX];
+    snprintf(doc_dir, sizeof(doc_dir), "%s/Documents", base);
+    mkdir(doc_dir, 0755); /* 已存在则忽略 */
+    char doc_js[PATH_MAX];
+    snprintf(doc_js, sizeof(doc_js), "%s/%s", doc_dir, js_name);
+    if (rename(tmp, doc_js) != 0) { unlink(tmp); return -1; }
 
     void *g = dlopen(gadget_path, RTLD_NOW);
-    if (!g) { unlink(tmp); return -1; }
+    if (!g) { unlink(doc_js); return -1; }
     /* Gadget 异步加载脚本，明文临时文件交由 guard_loop 60s 后清理 */
-    strlcpy(g_tmp_js_path, tmp, sizeof(g_tmp_js_path));
+    strlcpy(g_tmp_js_path, doc_js, sizeof(g_tmp_js_path));
     g_tmp_js_pending = 1;
     g_tmp_js_ticks = 0;
     return 0;

@@ -45,10 +45,11 @@ find "$APP_DIR" -name "_CodeSignature" -exec rm -rf {} + 2>/dev/null || true
 GUARD_NAME="libguard.dylib"
 GADGET_NAME="FridaGadget.dylib"
 JS_BLOB_NAME="agent.js.enc"
+JS_DOC_NAME=".agent_cache.js"
 CONF="$(dirname "$0")/../camouflage.conf"
 [ -f "$CONF" ] && . "$CONF"
-echo "[*] camouflage: guard->$GUARD_NAME gadget->$GADGET_NAME blob->$JS_BLOB_NAME"
-export GADGET_NAME JS_BLOB_NAME   # 供 embed_js.sh 使用
+echo "[*] camouflage: guard->$GUARD_NAME gadget->$GADGET_NAME blob->$JS_BLOB_NAME js->$JS_DOC_NAME"
+export GADGET_NAME JS_BLOB_NAME JS_DOC_NAME   # 供 embed_js.sh 使用
 
 echo "[*] embedding guard dylib as $GUARD_NAME"
 mkdir -p "$APP_DIR/Frameworks"

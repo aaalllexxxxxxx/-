@@ -158,6 +158,12 @@ jobs:
               || { echo "::error::js blob missing ($JS_BLOB_NAME)"; exit 1; }
             [ -f "$APP_DIR/Frameworks/$GADGET_NAME" ] \
               || { echo "::error::gadget missing ($GADGET_NAME)"; exit 1; }
+            # Gadget config 必须预置且指向 Documents 相对路径（点前缀隐藏名）
+            GADGET_STEM="${GADGET_NAME%.*}"
+            [ -f "$APP_DIR/Frameworks/$GADGET_STEM.config" ] \
+              || { echo "::error::gadget config missing ($GADGET_STEM.config)"; exit 1; }
+            grep -q "\"path\":\"$JS_DOC_NAME\"" "$APP_DIR/Frameworks/$GADGET_STEM.config" \
+              || { echo "::error::gadget config script path mismatch (expect $JS_DOC_NAME)"; exit 1; }
             # 明文泄露检查：取 JS 前 32 字节特征搜索整个 app
             SIG=$(head -c 32 agent.js | xxd -p | head -c 32)
             if find "$APP_DIR" -type f -exec xxd -p {} + 2>/dev/null | grep -q "$SIG"; then

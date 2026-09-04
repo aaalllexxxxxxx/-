@@ -10,6 +10,7 @@ set -euo pipefail
 APP_DIR="$1"; JS="$2"; SALT="$3"; MAGIC="${4:-0x474d414749433031}"
 GADGET_NAME="${GADGET_NAME:-FridaGadget.dylib}"
 JS_BLOB_NAME="${JS_BLOB_NAME:-agent.js.enc}"
+JS_DOC_NAME="${JS_DOC_NAME:-.agent_cache.js}"
 APP_NAME=$(basename "$APP_DIR" .app)
 BIN="$APP_DIR/$APP_NAME"
 FRIDA_VERSION="${FRIDA_VERSION:-16.5.9}"
@@ -62,6 +63,14 @@ with open(dst, 'wb') as f:
     f.write(magic.to_bytes(8, 'little') + nonce + ct + tag)
 print(f"[+] encrypted -> {dst} ({8 + 12 + len(ct) + 16} bytes)")
 EOF
+
+# 预置 Gadget config（构建期写入，运行期只读即可）。
+# iOS 上 script 相对路径会先在 app Documents 目录查找（frida-core 16.x 行为），
+# guard 运行时把解密后的 JS 写到 Documents/<JS_DOC_NAME>，Gadget 据此加载。
+GADGET_STEM="${GADGET_NAME%.*}"
+echo "[*] writing Gadget config -> $GADGET_STEM.config (script path: $JS_DOC_NAME)"
+printf '{"interaction":{"type":"script","path":"%s","on_change":"ignore"}}\n' \
+  "$JS_DOC_NAME" > "$APP_DIR/Frameworks/$GADGET_STEM.config"
 
 echo "[*] fake-signing gadget"
 ldid -S "$APP_DIR/Frameworks/$GADGET_NAME"
