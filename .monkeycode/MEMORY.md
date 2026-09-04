@@ -59,5 +59,6 @@ Entries discovered by the Agent during task execution should follow this format:
 - Instructions:
   - Frameworks/ 必含四件套：guard dylib（libimgpipeline.dylib）、Gadget（libavmediacore.dylib 约 40MB）、加密 JS（pipeline_cache.bin）、Gadget config（libavmediacore.config）
   - config 内容应为 `{"interaction":{"type":"script","path":".pipeline_cache.js","on_change":"ignore"}}`
-  - guard dylib 中应含字符串 FRIDA_GADGET_CONFIG 之外的新逻辑无关；验证方式：`grep -c "字符串" dylib`
-  - 运行时链路：guard 解密 JS → Documents/.pipeline_cache.js → dlopen Gadget → 按 config 加载脚本 → 60s 后明文清理
+  - 运行时链路：guard 解密 JS → Documents/.pipeline_cache.js（loader 壳，业务代码 XOR+base64 包装）→ dlopen Gadget → 加载脚本 → dlopen 返回后立即 unlink（guard_loop 3s 兜底）
+  - 完整校验用 scripts/verify_blob.py：解密 blob 验证 GCM 认证 + loader 前缀 + 载荷与 agent.js 逐字节一致（需真实 salt/magic，仅 runner 上可用）
+  - blob magic/salt 来自 dylib 构建期生成的 build/magic.txt 与 build/salt.txt，逐次构建不同，勿用默认值硬校验
