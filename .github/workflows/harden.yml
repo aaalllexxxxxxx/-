@@ -18,7 +18,7 @@ on:
         required: false
         default: "app_hardened.ipa"
       use_ollvm:
-        description: "仓库没有自带 dylib 时，是否用 OLLVM 混淆编译（默认开启，防破解要求）"
+        description: "是否用 O-MVLL 混淆编译（默认开启，防破解要求；false 时用 plain build）"
         required: false
         default: "true"
       entitlements:
@@ -37,7 +37,9 @@ concurrency:
 
 jobs:
   harden:
-    runs-on: macos-14
+    # O-MVLL 插件版本与 Xcode 严格绑定: 1.9.1 要求 Xcode 26.5
+    # (macos-26 镜像自带 /Applications/Xcode_26.5.app)
+    runs-on: macos-26
     timeout-minutes: 90
 
     steps:
@@ -104,19 +106,23 @@ jobs:
 
       # ---------- 4. 编译（仅无预编译 dylib 时） ----------
       - name: Build guard dylib (plain)
-        if: steps.dylib.outputs.source == 'compile' && inputs.use_ollvm != 'true'
+        if: steps.dylib.outputs.source == 'compile' && inputs.use_ollvm == 'false'
         run: ./scripts/build_guard.sh build
 
-      - name: Build guard dylib (OLLVM obfuscated)
-        if: steps.dylib.outputs.source == 'compile' && inputs.use_ollvm == 'true'
+      # O-MVLL 混淆为默认路径; push 触发时 inputs.use_ollvm 为空,同样走混淆
+      - name: Build guard dylib (O-MVLL obfuscated)
+        if: steps.dylib.outputs.source == 'compile' && inputs.use_ollvm != 'false'
         run: |
-          curl -fL --retry 3 --max-time 300 -o /tmp/ollvm.tar.gz \
-            https://github.com/heroims/obfuscator/releases/download/llvm-13.0.1/Obfuscator-LLVM-13.0.1-macOS.tar.gz \
-            || { echo "::warning::ollvm unavailable, fallback to plain build"; ./scripts/build_guard.sh build; exit 0; }
-          mkdir -p /tmp/ollvm && tar xzf /tmp/ollvm.tar.gz -C /tmp/ollvm
-          OLLVM_HOME=$(find /tmp/ollvm -name clang -type f | head -1 | xargs dirname | xargs dirname)
-          OLLVM_HOME="$OLLVM_HOME" ./scripts/obfuscate_build.sh build
-          cp build/libguard.sha256 /tmp/ || true
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_26.5.app
+          OMVLL_DIR=/tmp/omvll
+          mkdir -p "$OMVLL_DIR"
+          curl -fL --retry 3 --max-time 600 -o /tmp/omvll.tar.gz \
+            https://github.com/open-obfuscator/o-mvll/releases/download/1.9.1/omvll_v1-9-1_macos_2026-07-08T15_08_58.tar.gz \
+            || { echo "::warning::o-mvll download failed, fallback to plain build"; ./scripts/build_guard.sh build; exit 0; }
+          # 只解压插件与内置 Python 标准库,跳过发行包里的 Python 源码树
+          tar xzf /tmp/omvll.tar.gz -C "$OMVLL_DIR" ./omvll-xcode.dylib ./Python-3.10.7/Lib
+          OMVLL_HOME="$OMVLL_DIR" ./scripts/obfuscate_build.sh build
 
       # ---------- 5. 注入 + JS 加密嵌入 + 伪签 ----------
       - name: Inject + embed JS + fake-sign
