@@ -1,6 +1,3 @@
-/*
- * JH (com.aughpjy.jh) - 性能提速脚本 V16
-
 
 if (ObjC.available) {
 
