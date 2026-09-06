@@ -28,28 +28,34 @@ chmod 755 "$APP_DIR/Frameworks/$GADGET_NAME"
 install_name_tool -id "@executable_path/Frameworks/$GADGET_NAME" \
   "$APP_DIR/Frameworks/$GADGET_NAME" 2>/dev/null || true
 
-echo "[*] wrapping agent.js with self-decrypting loader (XOR+base64, plaintext never hits disk)"
+echo "[*] wrapping agent.js with self-decrypting loader (XOR+hex, plaintext never hits disk)"
 python3 - "$JS" "$APP_DIR/Frameworks/$JS_DOC_NAME" <<'PYEOF'
-import sys, os, base64
+import sys, os
 
 src, dst = sys.argv[1], sys.argv[2]
 with open(src, 'rb') as f:
     raw = f.read()
 
-# 业务代码 XOR+base64，loader 在 JS 引擎内存里解码 eval。
+# 业务代码 XOR+hex，loader 在 JS 引擎内存里解码 eval。
 # 磁盘上只有 loader 壳，明文业务逻辑只存在于内存。
+# 注意：不能用 base64+atob —— frida 的 QuickJS 运行时不提供 atob/btoa
+# （已核实 gadget 16.5.9 二进制符号），loader 会在第一行抛 ReferenceError
+# 导致脚本静默失败。hex 解码只依赖 parseInt/String.fromCharCode 等标准函数。
 xor_key = os.urandom(32)
 enc = bytes(b ^ xor_key[i % len(xor_key)] for i, b in enumerate(raw))
-b64 = base64.b64encode(enc).decode()
-key_hex = xor_key.hex()
+d_hex = enc.hex()
+k_hex = xor_key.hex()
 
 loader = (
-    "const __k='" + key_hex + "';const __d='" + b64 + "';"
-    "(function(){var kb=[];for(var i=0;i<__k.length;i+=2)kb.push(parseInt(__k.substr(i,2),16));"
-    "var db=atob(__d),bs=[];for(var j=0;j<db.length;j++)bs.push(String.fromCharCode(db.charCodeAt(j)^kb[j%kb.length]));"
+    "const __k='" + k_hex + "';const __d='" + d_hex + "';"
+    "(function(){"
+    "function h2b(h){var r=[],i;for(i=0;i<h.length;i+=2)r.push(parseInt(h.substr(i,2),16));return r;}"
+    "var kb=h2b(__k),db=h2b(__d),bs=[],n=kb.length;"
+    "for(var j=0;j<db.length;j++)bs.push(String.fromCharCode(db[j]^kb[j%n]));"
     "var s=bs.join('');"
     "try{s=decodeURIComponent(escape(s));}catch(e){}"
-    "(0,eval)(s);})();"
+    "try{(0,eval)(s);}catch(e){console.log('[pipeline] init failed: '+e);}"
+    "})();"
 )
 
 with open(dst, 'w') as f:
