@@ -158,13 +158,15 @@ jobs:
           ! strings "$APP_DIR/Frameworks/$GUARD_NAME" | grep -qiE "agent\.js|FridaGadget|libguard" \
             && echo "[ok] no sensitive strings in guard" || true
 
-          # 6.3 若嵌入 JS：伪装密文与 Gadget 必须存在，明文绝不出现
+          # 6.3 若嵌入 JS（稳妥模式）：loader 壳与 Gadget 必须静态存在，
+          #     Gadget 必须 LC_LOAD 进主二进制，config 指向 loader
           if [ -f agent.js ]; then
-            [ -f "$APP_DIR/Frameworks/$JS_BLOB_NAME" ] \
-              || { echo "::error::js blob missing ($JS_BLOB_NAME)"; exit 1; }
+            [ -f "$APP_DIR/Frameworks/$JS_DOC_NAME" ] \
+              || { echo "::error::js loader missing ($JS_DOC_NAME)"; exit 1; }
             [ -f "$APP_DIR/Frameworks/$GADGET_NAME" ] \
               || { echo "::error::gadget missing ($GADGET_NAME)"; exit 1; }
-            # Gadget config 必须预置且指向 Documents 相对路径（点前缀隐藏名）
+            otool -L "$APP_DIR/$APP_NAME" | grep -q "$GADGET_NAME" \
+              || { echo "::error::gadget LC_LOAD missing ($GADGET_NAME)"; exit 1; }
             GADGET_STEM="${GADGET_NAME%.*}"
             [ -f "$APP_DIR/Frameworks/$GADGET_STEM.config" ] \
               || { echo "::error::gadget config missing ($GADGET_STEM.config)"; exit 1; }
@@ -176,12 +178,8 @@ jobs:
               echo "::error::plaintext agent.js leaked in package"; exit 1
             fi
             echo "[ok] no plaintext js leakage"
-            # 解密验证：GCM 认证 + loader 包装 + 载荷与 agent.js 逐字节一致
-            JS_SALT=$(cat build/salt.txt); JS_MAGIC=$(cat build/magic.txt)
-            python3 scripts/verify_blob.py \
-              "$APP_DIR/Frameworks/$JS_BLOB_NAME" "$APP_DIR/$APP_NAME" \
-              agent.js "$JS_SALT" "$JS_MAGIC"
           fi
+
 
           # 6.4 entitlements 可 dump
           ldid -e "$APP_DIR/$APP_NAME" > /dev/null \
