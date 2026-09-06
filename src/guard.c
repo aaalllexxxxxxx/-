@@ -542,7 +542,7 @@ static void guard_init(void) {
 
 #ifndef GUARD_AUTH_BRIDGE
     /* 独立模式（无卡密模块）：先做一轮快速环境检查，通过即加载 Frida JS。
-     * 桥接模式（-DGUARD_AUTH_BRIDGE）：JS 加载由 guard_bridge.mm 按卡密状态控制 */
+     * 桥接模式（-DGUARD_AUTH_BRIDGE）：JS 加载与卡密巡检由 guard_bridge.mm 统一控制 */
     if (!debugger_attached() && !injected_framework_present() && !prologue_tampered()) {
         guard_load_frida_agent();
     }

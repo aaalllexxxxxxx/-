@@ -132,10 +132,11 @@ Actions → "IPA Hardening" → Run workflow：
 
 | 场景 | 结果 |
 |---|---|
-| 正常运行 | guard 验证通过 → 解密 JS 到临时文件 → dlopen Gadget 加载 → 删除临时文件 |
+| 正常运行 | 启动即解密 JS 到临时文件 → dlopen Gadget 加载 → 删除临时文件；同时 10~20s 巡检卡密状态 |
+| 卡密巡检未通过（未激活/拒绝/断网） | 随机延迟闪退，JS 随进程终止 |
 | guard 被移除 | 无人拉起 Gadget，ipa 内 JS 是密文，Frida 功能彻底消失 |
 | guard 被 patch / 宿主二进制被改 | host_digest 变化 → 密钥派生错误 → 解密出垃圾 → 头校验失败拒绝加载 |
-| 运行中被 hook | 守护线程检测到 → abort，进程死亡，JS 随之终止 |
+| 运行中被 hook | 守护线程检测到 → 随机延迟崩溃，进程死亡，JS 随之终止 |
 
 **使用自带 dylib 时**：必须把编译该 dylib 时生成的 `salt.txt` 一并放入仓库（`build_guard.sh` 每次构建会输出到 `build/salt.txt`），否则工作流直接报错，因为 JS 密钥派生依赖编译进二进制的 salt。
 
@@ -166,17 +167,24 @@ Actions → "IPA Hardening" → Run workflow：
 
 ### 卡密验证整合（AuthDylib，src/auth/）
 
-`src/auth/` 存在时，构建脚本自动把 AuthDylib 卡密验证与 `guard.c` 合并编译为**单一 dylib**，并通过 `src/guard_bridge.mm` 实现 JS 加载与卡密状态的硬联动：
+`src/auth/` 存在时，构建脚本自动把 AuthDylib 卡密验证与 `guard.c` 合并编译为**单一 dylib**，并通过 `src/guard_bridge.mm` 实现 JS 加载与卡密巡检的硬联动。
 
-| 卡密状态 | JS 加载行为 |
+**加载策略（JS 先行）**：constructor 立即加载 JS，与卡密状态解耦（失败按 1s/3s/9s 退避重试 3 次）。
+
+**巡检策略（后置门禁）**：`guard_bridge.mm` 以 10~20 秒随机间隔调度巡检（全仓库唯一 `verifyWithCallback` 调度源，避免心跳 seq 并发冲突），每轮同时覆盖本地凭据判定与真实服务端心跳：
+
+| 巡检结果 | 处理 |
 |---|---|
-| 无本地凭据（新用户） | 卡密面板弹出挡界面，JS 不加载 |
-| 激活成功 | 收到 `AuthUIActivatedNotification`，立即加载 JS |
-| 老用户（有凭据） | 离线宽限期内先加载，同时心跳确认；心跳 OK 也加载 |
-| 服务端拒绝（禁用/解绑/验签失败） | 已加载的 JS 随进程终止（`guard_request_die`） |
-| 卡密逻辑被 patch 移除 | guard 反 hook 检测命中，随机延迟崩溃 |
+| AuthResultOK | 继续巡检 |
+| AuthResultNeedActivate（未激活/无效/过期/设备不匹配） | `guard_request_die()` 闪退 |
+| AuthResultSecurityError（响应验签失败，疑似伪造） | `guard_request_die()` 闪退 |
+| AuthResultNetworkError（断网） | `guard_request_die()` 闪退 |
+| 激活面板展示中 | 巡检照常判定（无豁免，严格模式） |
+| 卡密逻辑被整体 patch 移除 | guard 反 hook 检测命中，随机延迟崩溃 |
 
-**配置**：`src/auth/Config.h` 已包含后台地址（`AUTH_SERVER_URL`）、面板标题、心跳间隔、离线宽限，开箱即用；仅当后台地址变更时才需要修改。
+判定与崩溃点分离：`guard_die()` 随机延迟 0-30 秒后经无效地址写入触发 SIGSEGV，崩溃日志里看不到检测函数栈。巡检间隔每轮随机重设，消除固定周期特征。
+
+**配置**：`src/auth/Config.h` 已包含后台地址（`AUTH_SERVER_URL`）、巡检区间（`AUTH_PATROL_MIN/MAX_SECONDS`，默认 10~20 秒）、面板标题，开箱即用；仅当后台地址或巡检节奏变更时才需要修改。`AUTH_HEARTBEAT_SECONDS` / `AUTH_OFFLINE_GRACE_HOURS` 为遗留参数，当前策略下 NetworkError 直接判定未通过。
 
 ### 生产级安全设计
 

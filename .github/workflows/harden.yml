@@ -18,9 +18,9 @@ on:
         required: false
         default: "app_hardened.ipa"
       use_ollvm:
-        description: "仓库没有自带 dylib 时，是否用 OLLVM 混淆编译"
+        description: "仓库没有自带 dylib 时，是否用 OLLVM 混淆编译（默认开启，防破解要求）"
         required: false
-        default: "false"
+        default: "true"
       entitlements:
         description: "追加 entitlements（逗号分隔），留空保留原有"
         required: false

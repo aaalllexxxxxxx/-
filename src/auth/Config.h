@@ -17,10 +17,17 @@
 #define AUTH_PROJECT_SLUG @""
 
 // 心跳间隔(秒),服务端可调区间 60-600,默认 60
+// (遗留参数:运行期巡检间隔由 AUTH_PATROL_MIN/MAX_SECONDS 控制,
+//  该值仅保留给内部依赖心跳约定的旧逻辑引用)
 #define AUTH_HEARTBEAT_SECONDS 60
 
 // 离线容忍:最后一次心跳成功后 N 小时内,断网也放行
-// (服务端宽限默认 0 天,此值仅影响断网期间的本地体验,联网后服务端仍会实时校验)
+// (遗留参数:当前巡检策略下 NetworkError 直接判定未通过,此值仅保留兼容)
 #define AUTH_OFFLINE_GRACE_HOURS 24
+
+// 卡密巡检间隔区间(秒):每轮在 [MIN, MAX] 内随机取值后重设定时器,
+// 本地凭据判定与真实服务端心跳同时执行,任一未通过即终止进程
+#define AUTH_PATROL_MIN_SECONDS 10
+#define AUTH_PATROL_MAX_SECONDS 20
 
 #endif /* AUTH_CONFIG_H */
