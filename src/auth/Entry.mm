@@ -9,6 +9,8 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+static void AuthDylibCheck(NSInteger attempt);
+
 __attribute__((constructor))
 static void AuthDylibEntry(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
