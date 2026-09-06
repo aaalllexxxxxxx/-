@@ -1,21 +1,6 @@
 /*
- * JH (com.aughpjy.jh) - 卡密验证绕过脚本 V16
- *
- * V16 关键修复 (基于真实卡密数据捕获 + IDA 静态分析):
- *
- * 1.【根因】dyld 反注入检测:
- *    sub_100004000/sub_1000040B0 遍历 dyld image, sub_100004050 用 strstr 匹配黑名单
- *    (FridaGadget/frida-agent/frida-gadget/libcycript/Cycript/SSLKillSwitch/sslkill/
- *     SSLKill/RevealServer/Flex.dylib/libFlex), 命中即调 sub_10020BC10:
- *      → +[NwGameOffsets clear] 清空偏移 + setRuntimeLicenseOK:0 + 引擎撤销标志
- *    真实卡密下心跳/watch会重新拉取自愈; 绕过模式下被清即永久失效 → 绘制不生效
- *    修复: 替换 sub_100004050 永远返回0(未检测到) + 置空 sub_10020BC10 (双保险)
- *
- * 2.【数据】真实偏移: gWorld = 0x1148B608 (旧值 0x10C464C8 已过期)
- *    字典格式与旧版一致: {"game":"pubg","cfg_ver":1,"exp":...,"offsets":{...}}
- *
- * 3. 保持 V15 全部 license 检查放行 hook
- */
+ * JH (com.aughpjy.jh) - 性能提速脚本 V16
+
 
 if (ObjC.available) {
 
@@ -27,12 +12,6 @@ if (ObjC.available) {
         return m.implementation;
     }
 
-    // ==========================================
-    // 0. 中和 dyld 反注入检测 (V16 核心)
-    //    IDA imagebase = 0x100000000
-    // ==========================================
-
-    // 注意: 越狱设备上 enumerateModules()[0] 可能是 systemhook 注入库, 必须用 mainModule
     var mainMod = Process.mainModule || (function () {
         var mods = Process.enumerateModules();
         for (var i = 0; i < mods.length; i++) {
@@ -157,9 +136,6 @@ if (ObjC.available) {
         console.log('[+] beginVerification REPLACEd');
     }
 
-    // ==========================================
-    // 3. 保护性 Hook - 阻止吊销/心跳/定时器/退出/清token
-    // ==========================================
 
     var emptyVoid = new NativeCallback(function() {}, 'void', ['pointer', 'pointer']);
     var emptyVoid2 = new NativeCallback(function() {}, 'void', ['pointer', 'pointer', 'pointer']);
@@ -220,9 +196,7 @@ if (ObjC.available) {
     var nw_saveKamiExp = getImpl('NwSession', '- nw_saveKamiExp:');
     if (nw_saveKamiExp) Interceptor.attach(nw_saveKamiExp, { onEnter: function(a) { a[2] = ptr(9999999999); } });
 
-    // ==========================================
-    // 4. NxFeat 特性门控 → 全部放行
-    // ==========================================
+
 
     var espEnabled = getImpl('NxFeat', '+ espEnabled');
     if (espEnabled) Interceptor.attach(espEnabled, { onLeave: function(r) { if (r.toInt32() == 0) r.replace(ptr(1)); } });
@@ -261,9 +235,7 @@ if (ObjC.available) {
     var offsetsStale = getImpl('NwGameOffsets', '+ isStale');
     if (offsetsStale) Interceptor.attach(offsetsStale, { onLeave: function(r) { if (r.toInt32() != 0) r.replace(ptr(0)); } });
 
-    // ==========================================
-    // 6. 偏移读侧拦截 —— 强制覆盖
-    // ==========================================
+ 
 
     var u64Impl = getImpl('NwGameOffsets', '+ u64:');
     if (u64Impl) {
