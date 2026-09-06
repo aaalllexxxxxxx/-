@@ -1,7 +1,9 @@
 # O-MVLL 混淆配置,由 obfuscate_build.sh 通过 OMVLL_CONFIG 传入
 # 注意: 不启用字符串加密 pass(StringEncOptGlobal) —— 其生成的
 # "指针->CString 重定向"结构会让 Xcode 26 的 ld 与 ld_classic 都崩溃
-# (assertion: contentType == typeCString),其余 pass 均可正常链接。
+# (assertion: contentType == typeCString)。同时不启用函数抽取/基本块复制:
+# 两者会把 ARC block 辅助符号(___destroy_helper_block_*)提升为强符号,
+# 造成跨编译单元 duplicate symbol 链接错误。
 import omvll
 from functools import lru_cache
 
@@ -26,14 +28,6 @@ class GuardConfig(omvll.ObfuscationConfig):
     # 控制流分裂(bogus control flow 等价物)
     def break_control_flow(self, mod: omvll.Module, func: omvll.Function):
         return omvll.ObfuscationConfig.default_config(self, mod, func, [], [], [], 10)
-
-    # 函数抽取 / 基本块复制,低概率控制体积
-    def function_outline(self, _, __):
-        return omvll.FunctionOutlineWithProbability(10)
-
-    def basic_block_duplicate(self, _, __):
-        return omvll.BasicBlockDuplicateWithProbability(10)
-
 
 @lru_cache(maxsize=1)
 def omvll_get_config() -> omvll.ObfuscationConfig:
