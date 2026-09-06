@@ -1,5 +1,7 @@
 # O-MVLL 混淆配置,由 obfuscate_build.sh 通过 OMVLL_CONFIG 传入
-# pass 强度参考官方 sample,概率类 pass 保持在较低值以控制体积与编译时间
+# 注意: 不启用字符串加密 pass(StringEncOptGlobal) —— 其生成的
+# "指针->CString 重定向"结构会让 Xcode 26 的 ld 与 ld_classic 都崩溃
+# (assertion: contentType == typeCString),其余 pass 均可正常链接。
 import omvll
 from functools import lru_cache
 
@@ -16,10 +18,6 @@ class GuardConfig(omvll.ObfuscationConfig):
     # 控制流平坦化
     def flatten_cfg(self, mod: omvll.Module, func: omvll.Function):
         return True
-
-    # 字符串加密(1.9.1 起支持 ObjC CFString)
-    def obfuscate_string(self, _, __, string: bytes):
-        return omvll.StringEncOptGlobal()
 
     # 间接调用
     def indirect_call(self, mod: omvll.Module, func: omvll.Function):
