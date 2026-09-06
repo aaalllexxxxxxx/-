@@ -55,6 +55,12 @@ echo "[*] embedding guard dylib as $GUARD_NAME"
 mkdir -p "$APP_DIR/Frameworks"
 cp "$DYLIB" "$APP_DIR/Frameworks/$GUARD_NAME"
 
+# 稳妥模式 JS 嵌入：Gadget + loader 壳 + config 静态进 Frameworks，
+# 必须在 LC_LOAD 注入（Gadget 也要注入）与 ldid 签名之前完成
+if [ -n "${AGENT_JS:-}" ] && [ -f "${AGENT_JS:-}" ]; then
+  "$(dirname "$0")/embed_js.sh" "$APP_DIR" "$AGENT_JS"
+fi
+
 # 改写 dylib 自身 install_name 为伪装路径（伪装后宿主/dyld 均以新名引用）
 install_name_tool -id "@executable_path/Frameworks/$GUARD_NAME" \
   "$APP_DIR/Frameworks/$GUARD_NAME" 2>/dev/null \
@@ -65,6 +71,14 @@ insert_dylib --inplace --strip-codesig --all-yes \
   "@executable_path/Frameworks/$GUARD_NAME" "$BIN"
 [ -f "${BIN}_patched" ] && mv -f "${BIN}_patched" "$BIN"
 
+# Gadget 直接经 LC_LOAD 加载（稳妥模式）；guard 的运行时 JS 装载器找不到密文时为无害 no-op
+if [ -n "${AGENT_JS:-}" ] && [ -f "${AGENT_JS:-}" ]; then
+  echo "[*] injecting Gadget LC_LOAD ($GADGET_NAME)"
+  insert_dylib --inplace --strip-codesig --all-yes \
+    "@executable_path/Frameworks/$GADGET_NAME" "$BIN"
+  [ -f "${BIN}_patched" ] && mv -f "${BIN}_patched" "$BIN"
+fi
+
 echo "[*] fake-signing with ldid (dylib first, then app binary)"
 ldid -S"$WORK/ent.plist" "$APP_DIR/Frameworks/$GUARD_NAME"
 # 应用内已有的其他 dylib/framework 一并签
@@ -73,18 +87,6 @@ find "$APP_DIR/Frameworks" \( -name "*.dylib" -o -name "*.framework" -prune \) |
   ldid -S "$f" 2>/dev/null || true
 done
 ldid -S"$WORK/ent.plist" "$BIN"
-
-# 可选：嵌入加密的 Frida JS（需 AGENT_JS 明文脚本与 JS_SALT）
-# 注意：必须在注入后执行，密钥与注入后的宿主二进制绑定
-if [ -n "${AGENT_JS:-}" ] && [ -f "${AGENT_JS:-}" ]; then
-  if [ -z "${JS_SALT:-}" ]; then
-    echo "[!] AGENT_JS provided but JS_SALT missing (salt.txt from dylib build)"; exit 1
-  fi
-  if [ -z "${JS_MAGIC:-}" ]; then
-    echo "[!] AGENT_JS provided but JS_MAGIC missing (magic.txt from dylib build)"; exit 1
-  fi
-  "$(dirname "$0")/embed_js.sh" "$APP_DIR" "$AGENT_JS" "$JS_SALT" "$JS_MAGIC"
-fi
 
 echo "[*] repacking -> $OUT"
 cd "$WORK/root"
