@@ -504,9 +504,16 @@ int guard_load_frida_agent(void) {
     js_name[pe - pk] = 0;
     if (js_name[0] == '/') { unlink(tmp); return -1; } /* 仅支持相对路径（Documents 解析） */
 
-    /* 5. 把明文 JS rename 到 Documents/<js_name>（可写沙盒目录，Gadget 相对路径优先在此查找） */
+    /* 5. 把明文 JS rename 到 数据容器 Documents/<js_name>。
+     * 必须用 getenv("HOME")(iOS App 进程中即数据容器根目录)推导 Documents,
+     * 不能用 bundle 目录(_NSGetExecutablePath 所在的 <App>.app)拼 Documents ——
+     * bundle 与数据容器是两个不同路径;Gadget 相对路径解析顺序为
+     * 数据容器 Documents(NSSearchPathForDirectoriesInDomains) -> Frameworks,
+     * 写到 <App>.app/Documents 两边都查不到,脚本永远加载不到。 */
+    const char *home = getenv("HOME");
     char doc_dir[PATH_MAX];
-    snprintf(doc_dir, sizeof(doc_dir), "%s/Documents", base);
+    snprintf(doc_dir, sizeof(doc_dir), "%s/Documents",
+             (home && *home) ? home : base);
     mkdir(doc_dir, 0755); /* 已存在则忽略 */
     char doc_js[PATH_MAX];
     snprintf(doc_js, sizeof(doc_js), "%s/%s", doc_dir, js_name);
