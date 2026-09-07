@@ -12,7 +12,11 @@
 #   - 业务 JS 先过 javascript-obfuscator（可选，失败则回退原文），再加密
 #
 # 密钥派生（构建期与运行期 loader 完全一致）:
-#   digest     = SHA256(宿主主二进制前 4096 字节)   ← 运行期从内存读，绑定宿主
+#   digest     = SHA256(宿主主二进制 __TEXT 内偏移 0x4000 起的 4096 字节)
+#   ← 不能绑定文件头(前 4096 字节)：TrollStore 安装时 ldid 重签会改写头部
+#     load command 区(LC_CODE_SIGNATURE size)，实测导致安装后 digest 失配。
+#     0x4000 窗口位于 __TEXT 代码区，重签不触碰，安装后仍稳定；
+#     而 patch 业务代码仍会导致失配，互锁保持。
 #   keystream_i = SHA256(digest || salt(8,LE) || counter(u32,LE))   每块 32 字节
 #   明文       = magic(4, 构建期随机) || 业务 JS
 # 剥壳/移植到其他 App/patch 宿主二进制 → digest 变 → 解密结果 magic 校验不过 → 拒绝 eval。
@@ -74,8 +78,13 @@ import hashlib, os, sys
 
 host_bin, js_path, loader_path, config_path = sys.argv[1:5]
 
+WIN_OFF, WIN_LEN = 0x4000, 4096
 with open(host_bin, 'rb') as f:
-    digest = hashlib.sha256(f.read(4096)).digest()
+    f.seek(WIN_OFF)
+    window = f.read(WIN_LEN)
+if len(window) < WIN_LEN:
+    raise SystemExit(f"::error::host binary smaller than {WIN_OFF + WIN_LEN:#x}, adjust WIN_OFF")
+digest = hashlib.sha256(window).digest()
 with open(js_path, 'rb') as f:
     raw = f.read()
 
@@ -113,7 +122,7 @@ A("var " + v['gm'] + "=Process.enumerateModules()[0];"
 A("var " + v['cc'] + "=new NativeFunction(Module.getExportByName(null,'CC_SHA256'),'pointer',['pointer','uint32','pointer']);")
 A("var " + v['ib'] + "=Memory.alloc(4096)," + v['ob'] + "=Memory.alloc(64)," + v['ib2'] + "=Memory.alloc(64);")
 A("var " + v['h2b'] + "=function(h){var r=[],i;for(i=0;i<h.length;i+=2)r.push(parseInt(h.substr(i,2),16));return r;};")
-A("Memory.copy(" + v['ib'] + "," + v['gm'] + ".base,4096);")
+A("Memory.copy(" + v['ib'] + "," + v['gm'] + ".base.add(0x4000),4096);")
 A(v['cc'] + "(" + v['ib'] + ",4096," + v['ob'] + ");")
 A("var " + v['dg'] + "=new Uint8Array(Memory.readByteArray(" + v['ob'] + ",32));")
 A(v['rp'] + "('stage1 digest='+Array.prototype.map.call(" + v['dg'] + ",function(x){return ('0'+x.toString(16)).slice(-2);}).join('').slice(0,16));")
@@ -155,6 +164,7 @@ with open(config_path, 'w') as f:
 
 print(f"[+] host-bound payload -> {loader_path} ({len(loader)} bytes, "
       f"plain {len(raw)} bytes, {blocks} keystream blocks)")
+print(f"[+] build-side window digest (0x{WIN_OFF:x}+{WIN_LEN}): {digest.hex()}")
 PYEOF
     ;;
 
