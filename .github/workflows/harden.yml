@@ -29,6 +29,10 @@ on:
         description: "FridaGadget 版本"
         required: false
         default: "16.5.9"
+      debug:
+        description: "调试构建:启用 loader 分阶段弹窗(GEN_LOADER_DEBUG),用于真机定位"
+        required: false
+        default: "false"
 
 # 生产级：同一分支串行执行，防止并发构建互相覆盖 artifact
 concurrency:
@@ -130,6 +134,7 @@ jobs:
           EXTRA_ENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.entitlements || '' }}
           OUT_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}
           FRIDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.frida_version || '16.5.9' }}
+          GEN_LOADER_DEBUG: ${{ github.event_name == 'workflow_dispatch' && inputs.debug == 'true' && '1' || '' }}
         run: |
           [ -f agent.js ] && export AGENT_JS=agent.js || true
           [ -f build/salt.txt ] && export JS_SALT=$(cat build/salt.txt) || true
