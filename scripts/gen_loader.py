@@ -36,14 +36,14 @@ def main():
         return "v" + os.urandom(6).hex()
 
     names = ("S", "D", "kp", "cc", "sha", "ib", "ob", "h2b", "dg", "sl", "ctb",
-             "ks", "rp", "i1", "i2", "inp", "blk", "ptb", "mg", "sv")
+             "ks", "rp", "dbg", "i1", "i2", "inp", "blk", "ptb", "mg", "sv")
     v = {n: rid() for n in names}
     S, D = v["S"], v["D"]
     KP, CC, SHA = v["kp"], v["cc"], v["sha"]
     IB, OB, H2B = v["ib"], v["ob"], v["h2b"]
     DG, SL, CTB, KS = v["dg"], v["sl"], v["ctb"], v["ks"]
     RP, I1, I2, INP, BLK = v["rp"], v["i1"], v["i2"], v["inp"], v["blk"]
-    PTB, MG, SV = v["ptb"], v["mg"], v["sv"]
+    PTB, MG, SV, DBG = v["ptb"], v["mg"], v["sv"], v["dbg"]
     salt_hex = salt.hex()
     ct_hex = ct.hex()
     mg_csv = ",".join(str(b) for b in magic)
@@ -55,10 +55,11 @@ def main():
 
     A("const " + S + "='" + salt_hex + "'," + D + "='" + ct_hex + "';")
     A("(function(){")
+    A("var " + DBG + "=false;")  # 调试弹窗开关:置 true 重新构建即恢复真机弹窗
     A("function " + RP + "(m){console.log('[pipeline] '+m);"
-      "try{ObjC.schedule(ObjC.mainQueue,function(){"
+      "if(" + DBG + "){try{ObjC.schedule(ObjC.mainQueue,function(){"
       "ObjC.classes.UIAlertView.alloc().initWithTitle_message_delegate_cancelButtonTitle_otherButtonTitles_('pipeline',m,NULL,'ok',NULL).show();"
-      "});}catch(e){}}")
+      "});}catch(e){}}}")
     A("try{")
     A("var " + KP + "=Module.getExportByName(null,'guard_js_key');"
       "if(!" + KP + ")throw new Error('guard not present');")
