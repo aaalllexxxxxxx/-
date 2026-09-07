@@ -177,6 +177,13 @@ static uint64_t digest_self(void) {
  */
 static void guard_die(void);
 
+/* A2-universal: per-build 随机 32 字节 JS 解密密钥。
+ * 由构建脚本经 -include guard_js_key.inc 注入 g_js_key 定义。
+ * loader 通过此导出符号取密钥;guard 被移除则 loader 取不到 → JS 不加载。
+ * 适用于任意 IPA(不依赖宿主二进制,规避安装环节对二进制的改动)。 */
+__attribute__((visibility("default")))
+const void *guard_js_key(void) { return g_js_key; }
+
 /* 导出给 guard_bridge.mm：卡密被服务端拒绝时终止进程 */
 __attribute__((visibility("default")))
 void guard_request_die(void) {
