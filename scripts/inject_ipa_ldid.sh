@@ -87,10 +87,10 @@ find "$APP_DIR/Frameworks" \( -name "*.dylib" -o -name "*.framework" -prune \) |
 done
 ldid -S"$WORK/ent.plist" "$BIN"
 
-# A2: 宿主绑定加密的业务 JS + loader 壳 + config。
-# 必须在签名之后执行——digest 绑定的是最终宿主二进制（含 LC_LOAD 与签名）
+# A2-universal: 用 guard 密钥加密的业务 JS + loader 壳 + config（签名之后执行）
 if [ -n "${AGENT_JS:-}" ] && [ -f "${AGENT_JS:-}" ]; then
-  "$(dirname "$0")/embed_js.sh" payload "$APP_DIR" "$BIN" "$AGENT_JS"
+  JS_KEY="$(dirname "$DYLIB")/js_key.bin"
+  "$(dirname "$0")/embed_js.sh" payload "$APP_DIR" "$JS_KEY" "$AGENT_JS"
 fi
 
 echo "[*] repacking -> $OUT"
