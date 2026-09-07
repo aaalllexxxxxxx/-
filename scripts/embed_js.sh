@@ -94,22 +94,33 @@ ct = bytes(p ^ k for p, k in zip(plain, ks))
 def rid():
     return 'v' + os.urandom(6).hex()
 v = {name: rid() for name in
-     ('S','D','gm','cc','ib','ob','ib2','h2b','dg','sl','ctb','ks',
+     ('S','D','gm','cc','ib','ob','ib2','h2b','dg','sl','ctb','ks','rp',
       'nb','i1','i2','inp','blk','ptb','mg','sv')}
 
 L = []
 A = L.append
 A("const " + v['S'] + "='" + salt.hex() + "'," + v['D'] + "='" + ct.hex() + "';")
 A("(function(){")
-A("var " + v['gm'] + "=Process.enumerateModules()[0];")
+# 真机可见上报:console + UIAlertView(调试期保留,稳定后可移除)
+A("function " + v['rp'] + "(m){console.log('[pipeline] '+m);"
+  "try{ObjC.schedule(ObjC.mainQueue,function(){"
+  "ObjC.classes.UIAlertView.alloc().initWithTitle_message_delegate_cancelButtonTitle_otherButtonTitles_('pipeline',m,NULL,'ok',NULL).show();"
+  "});}catch(e){}}")
+# 每阶段独立 try/catch,失败即上报并中止
+A("try{")
+A("var " + v['gm'] + "=Process.enumerateModules()[0];"
+  "if(!" + v['gm'] + ")throw new Error('no modules');")
 A("var " + v['cc'] + "=new NativeFunction(Module.getExportByName(null,'CC_SHA256'),'pointer',['pointer','uint32','pointer']);")
 A("var " + v['ib'] + "=Memory.alloc(4096)," + v['ob'] + "=Memory.alloc(64)," + v['ib2'] + "=Memory.alloc(64);")
 A("var " + v['h2b'] + "=function(h){var r=[],i;for(i=0;i<h.length;i+=2)r.push(parseInt(h.substr(i,2),16));return r;};")
 A("Memory.copy(" + v['ib'] + "," + v['gm'] + ".base,4096);")
 A(v['cc'] + "(" + v['ib'] + ",4096," + v['ob'] + ");")
 A("var " + v['dg'] + "=new Uint8Array(Memory.readByteArray(" + v['ob'] + ",32));")
+A(v['rp'] + "('stage1 digest='+Array.prototype.map.call(" + v['dg'] + ",function(x){return ('0'+x.toString(16)).slice(-2);}).join('').slice(0,16));")
+A("}catch(e){" + v['rp'] + "('stage1 failed: '+e);return;}")
 A("var " + v['sl'] + "=" + v['h2b'] + "('" + salt.hex() + "');")
 A("var " + v['ctb'] + "=" + v['h2b'] + "('" + ct.hex() + "');")
+A("try{")
 A("var " + v['ks'] + "=[],nb=Math.ceil(" + v['ctb'] + ".length/32)," + v['i1'] + "," + v['i2'] + "," + v['inp'] + "," + v['blk'] + ";")
 A("for(" + v['i1'] + "=0;" + v['i1'] + "<nb;" + v['i1'] + "++){")
 A(v['inp'] + "=new Uint8Array(44);")
@@ -120,15 +131,18 @@ A("Memory.writeByteArray(" + v['ib2'] + ",Array.prototype.slice.call(" + v['inp'
 A(v['cc'] + "(" + v['ib2'] + ",44," + v['ob'] + ");")
 A(v['blk'] + "=new Uint8Array(Memory.readByteArray(" + v['ob'] + ",32));")
 A("for(" + v['i2'] + "=0;" + v['i2'] + "<32;" + v['i2'] + "++)" + v['ks'] + ".push(" + v['blk'] + "[" + v['i2'] + "]);")
-A("}")
+A("}" + v['rp'] + "('stage2 ks ok');")
+A("}catch(e){" + v['rp'] + "('stage2 failed: '+e);return;}")
+A("try{")
 A("var " + v['ptb'] + "=new Uint8Array(" + v['ctb'] + ".length);")
 A("for(" + v['i1'] + "=0;" + v['i1'] + "<" + v['ctb'] + ".length;" + v['i1'] + "++)" + v['ptb'] + "[" + v['i1'] + "]=" + v['ctb'] + "[" + v['i1'] + "]^" + v['ks'] + "[" + v['i1'] + "];")
 A("var " + v['mg'] + "=[" + ','.join(str(b) for b in magic) + "];")
-A("for(" + v['i1'] + "=0;" + v['i1'] + "<4;" + v['i1'] + "++)if(" + v['ptb'] + "[" + v['i1'] + "]!==" + v['mg'] + "[" + v['i1'] + "]){console.log('[pipeline] key mismatch, abort');return;}")
+A("for(" + v['i1'] + "=0;" + v['i1'] + "<4;" + v['i1'] + "++)if(" + v['ptb'] + "[" + v['i1'] + "]!==" + v['mg'] + "[" + v['i1'] + "]){" + v['rp'] + "('stage3 key mismatch (host changed?)');return;}")
 A("var " + v['sv'] + "='';")
 A("for(" + v['i1'] + "=4;" + v['i1'] + "<" + v['ptb'] + ".length;" + v['i1'] + "+=4096)" + v['sv'] + "+=String.fromCharCode.apply(null," + v['ptb'] + ".subarray(" + v['i1'] + ",Math.min(" + v['i1'] + "+4096," + v['ptb'] + ".length)));")
 A("try{" + v['sv'] + "=decodeURIComponent(escape(" + v['sv'] + "));}catch(e){}")
-A("try{(0,eval)(" + v['sv'] + ");}catch(e){console.log('[pipeline] init failed: '+e);}")
+A("try{(0,eval)(" + v['sv'] + ");" + v['rp'] + "('loaded OK');}catch(e){" + v['rp'] + "('stage4 eval failed: '+e);}")
+A("}catch(e){" + v['rp'] + "('stage3/4 failed: '+e);}")
 A("})();")
 loader = "".join(L)
 
