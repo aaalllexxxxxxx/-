@@ -28,8 +28,7 @@ echo "[*] guard string key: $KEY, js salt: $SALT, js magic: $MAGIC"
 python3 -c "
 import os
 k = os.urandom(32)
-open('$OUT_DIR/guard_js_key.inc','w').write('static const unsigned char g_js_key[32] = {' + ','.join('0x%02x'%x for x in k) + '};
-')
+open('$OUT_DIR/guard_js_key.inc','w').write('static const unsigned char g_js_key[32] = {' + ','.join('0x%02x'%x for x in k) + '};' + chr(10))
 open('$OUT_DIR/js_key.bin','wb').write(k)
 "
 echo "[*] js key injected -> $OUT_DIR/guard_js_key.inc"
