@@ -55,10 +55,9 @@ echo "[*] embedding guard dylib as $GUARD_NAME"
 mkdir -p "$APP_DIR/Frameworks"
 cp "$DYLIB" "$APP_DIR/Frameworks/$GUARD_NAME"
 
-# 稳妥模式 JS 嵌入：Gadget + loader 壳 + config 静态进 Frameworks，
-# 必须在 LC_LOAD 注入（Gadget 也要注入）与 ldid 签名之前完成
+# A2: 先把 Gadget 放进 Frameworks（必须在 LC_LOAD 注入之前）
 if [ -n "${AGENT_JS:-}" ] && [ -f "${AGENT_JS:-}" ]; then
-  "$(dirname "$0")/embed_js.sh" "$APP_DIR" "$AGENT_JS"
+  "$(dirname "$0")/embed_js.sh" gadget "$APP_DIR"
 fi
 
 # 改写 dylib 自身 install_name 为伪装路径（伪装后宿主/dyld 均以新名引用）
@@ -87,6 +86,12 @@ find "$APP_DIR/Frameworks" \( -name "*.dylib" -o -name "*.framework" -prune \) |
   ldid -S "$f" 2>/dev/null || true
 done
 ldid -S"$WORK/ent.plist" "$BIN"
+
+# A2: 宿主绑定加密的业务 JS + loader 壳 + config。
+# 必须在签名之后执行——digest 绑定的是最终宿主二进制（含 LC_LOAD 与签名）
+if [ -n "${AGENT_JS:-}" ] && [ -f "${AGENT_JS:-}" ]; then
+  "$(dirname "$0")/embed_js.sh" payload "$APP_DIR" "$BIN" "$AGENT_JS"
+fi
 
 echo "[*] repacking -> $OUT"
 cd "$WORK/root"
