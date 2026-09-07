@@ -24,6 +24,16 @@ echo "$SALT" > "$OUT_DIR/salt.txt"
 echo "$MAGIC" > "$OUT_DIR/magic.txt"
 echo "[*] guard string key: $KEY, js salt: $SALT, js magic: $MAGIC"
 
+# A2-universal: per-build 随机 32 字节 JS 解密密钥
+python3 -c "
+import os
+k = os.urandom(32)
+open('$OUT_DIR/guard_js_key.inc','w').write('static const unsigned char g_js_key[32] = {' + ','.join('0x%02x'%x for x in k) + '};
+')
+open('$OUT_DIR/js_key.bin','wb').write(k)
+"
+echo "[*] js key injected -> $OUT_DIR/guard_js_key.inc"
+
 OMVLL_DYLIB="$OMVLL_HOME/omvll-xcode.dylib"
 [ -f "$OMVLL_DYLIB" ] || { echo "::error::omvll-xcode.dylib not found in $OMVLL_HOME"; exit 1; }
 OMVLL_PYHOME=$(find "$OMVLL_HOME" -maxdepth 1 -type d -name "Python-*" | head -1)
@@ -39,7 +49,7 @@ EXTRA_LDFLAGS=""
 if ls src/auth/*.mm >/dev/null 2>&1; then
   echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
   SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
-  EXTRA_CFLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc"
+  EXTRA_CFLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc -I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
   EXTRA_LDFLAGS="-lc++ -framework UIKit -framework Security -framework CoreGraphics"
 fi
 
