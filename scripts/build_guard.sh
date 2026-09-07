@@ -13,6 +13,16 @@ echo "$SALT" > "$OUT_DIR/salt.txt"
 echo "$MAGIC" > "$OUT_DIR/magic.txt"
 echo "[*] guard string key: $KEY, js salt: $SALT, js magic: $MAGIC"
 
+# A2-universal: per-build 随机 32 字节 JS 解密密钥(注入 guard.c 并供 embed_js.sh 使用)
+python3 -c "
+import os
+k = os.urandom(32)
+open('$OUT_DIR/guard_js_key.inc','w').write('static const unsigned char g_js_key[32] = {' + ','.join('0x%02x'%x for x in k) + '};
+')
+open('$OUT_DIR/js_key.bin','wb').write(k)
+"
+echo "[*] js key injected -> $OUT_DIR/guard_js_key.inc"
+
 # 若存在 src/auth/*.mm（AuthDylib 卡密验证），与 guard.c + guard_bridge.mm
 # 合并编译为单一 dylib，并启用桥接模式（JS 加载由卡密状态控制）
 SRCS="src/guard.c"
@@ -21,7 +31,7 @@ EXTRA_LDFLAGS=""
 if ls src/auth/*.mm >/dev/null 2>&1; then
   echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
   SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
-  EXTRA_FLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc"
+  EXTRA_FLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc -I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
   EXTRA_LDFLAGS="-lc++ -framework UIKit -framework Security -framework CoreGraphics"
 fi
 
