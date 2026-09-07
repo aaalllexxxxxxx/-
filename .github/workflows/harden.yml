@@ -124,10 +124,22 @@ jobs:
           OMVLL_HOME="$OMVLL_DIR" ./scripts/obfuscate_build.sh build
 
       # ---------- 5. 注入 + JS 加密嵌入 + 伪签 ----------
+      - name: Resolve output names
+        id: names
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.output_name }}" ]; then
+            BASE="${{ inputs.output_name }}"
+          else
+            BASE="app_hardened.ipa"
+          fi
+          DEBUG="${BASE%.ipa}_debug.ipa"
+          echo "prod=$BASE" >> "$GITHUB_OUTPUT"
+          echo "debug=$DEBUG" >> "$GITHUB_OUTPUT"
+
       - name: Inject + embed (production, zero-trace)
         env:
           EXTRA_ENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.entitlements || '' }}
-          OUT_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}
+          OUT_NAME: ${{ steps.names.outputs.prod }}
           FRIDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.frida_version || '16.5.9' }}
         run: |
           [ -f agent.js ] && export AGENT_JS=agent.js || true
@@ -141,7 +153,7 @@ jobs:
       - name: Inject + embed (debug, with stage alerts)
         env:
           EXTRA_ENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.entitlements || '' }}
-          OUT_NAME: ${{ github.event_name == 'workflow_dispatch' && (inputs.output_name | sub(`\.ipa$`, ``)) ~ '_debug.ipa' || 'app_hardened_debug.ipa' }}
+          OUT_NAME: ${{ steps.names.outputs.debug }}
           FRIDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.frida_version || '16.5.9' }}
           GEN_LOADER_DEBUG: '1'
         run: |
@@ -154,7 +166,7 @@ jobs:
       - name: Verify artifact
         run: |
           set -euo pipefail
-          OUT_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}"
+          OUT_NAME="${{ steps.names.outputs.prod }}"
           unzip -q "$OUT_NAME" -d /tmp/verify_out
           APP_DIR=$(find /tmp/verify_out -maxdepth 3 -name "*.app" | head -1)
           APP_NAME=$(basename "$APP_DIR" .app)
@@ -202,7 +214,7 @@ jobs:
       - name: Generate manifest
         if: success()
         run: |
-          OUT_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}"
+          OUT_NAME="${{ steps.names.outputs.prod }}"
           {
             echo "{"
             echo "  \"input_sha256\": \"$(cut -d' ' -f1 /tmp/input.sha256)\","
@@ -222,9 +234,9 @@ jobs:
         with:
           name: hardened-ipa-${{ github.run_id }}
           path: |
-            ${{ github.event_name == 'workflow_dispatch' && inputs.output_name || 'app_hardened.ipa' }}
+            ${{ steps.names.outputs.prod }}
             manifest.json
-            ${{ github.event_name == 'workflow_dispatch' && (inputs.output_name | sub(`\.ipa$`, ``)) ~ '_debug.ipa' || 'app_hardened_debug.ipa' }}
+            ${{ steps.names.outputs.debug }}
           retention-days: 7
 
       # ---------- 8. 敏感材料清理 ----------
