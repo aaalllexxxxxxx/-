@@ -48,6 +48,8 @@ JS_BLOB_NAME="agent.js.enc"
 JS_DOC_NAME=".agent_cache.js"
 CONF="$(dirname "$0")/../camouflage.conf"
 [ -f "$CONF" ] && . "$CONF"
+# JS 调试弹窗开关(由 camouflage.conf 控制,供 embed_js.sh -> gen_loader.py)
+[ "$JS_DEBUG_ALERTS" = "true" ] && export GEN_LOADER_DEBUG=1 || true
 echo "[*] camouflage: guard->$GUARD_NAME gadget->$GADGET_NAME blob->$JS_BLOB_NAME js->$JS_DOC_NAME"
 export GADGET_NAME JS_BLOB_NAME JS_DOC_NAME   # 供 embed_js.sh 使用
 
