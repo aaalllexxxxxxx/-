@@ -11,6 +11,9 @@
 # 依赖: O-MVLL macOS 发行包 (omvll-xcode.dylib + Python-3.10.7/Lib) + omvll_config.py
 # 用法: OMVLL_HOME=/path/to/omvll ./obfuscate_build.sh [out_dir]
 set -euo pipefail
+# 读取功能开关(camouflage.conf)
+CONF="$(dirname "$0")/../camouflage.conf"
+[ -f "$CONF" ] && . "$CONF"
 
 OMVLL_HOME="${OMVLL_HOME:?please set OMVLL_HOME to your o-mvll dir}"
 OUT_DIR="${1:-build}"
@@ -45,7 +48,7 @@ export OMVLL_CONFIG="$PWD/omvll_config.py"
 SRCS="src/guard.c"
 EXTRA_CFLAGS=""
 EXTRA_LDFLAGS=""
-if ls src/auth/*.mm >/dev/null 2>&1; then
+if [ "$EMBED_AUTH_DYLIB" != "false" ] && ls src/auth/*.mm >/dev/null 2>&1; then
   echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
   SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
   EXTRA_CFLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc -I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
