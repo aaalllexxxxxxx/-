@@ -6,7 +6,8 @@
  *     （失败按 1s/3s/9s 退避重试，至多 3 次）
  *  2. 巡检：以 [AUTH_PATROL_MIN_SECONDS, AUTH_PATROL_MAX_SECONDS]
  *     区间随机间隔调用 verifyWithCallback（本地凭据 + 服务端心跳双检），
- *     NeedActivate / SecurityError / NetworkError 任一出现即 guard_request_die()
+ *     NeedActivate / SecurityError → 清凭据 + 弹激活面板(当场重新激活,不闪退);
+ *     NetworkError → 闪退(断网不容忍)
  *  3. 判定与崩溃点分离：guard_die() 随机延迟 0-30s 后 SIGSEGV
  *  4. 卡密逻辑被整体 patch 移除 -> guard.c 反 hook/反调试检测命中 -> 随机延迟崩溃
  *
@@ -18,6 +19,8 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import "auth/AuthUI.h"
 #import "auth/AuthManager.h"
 #import "auth/Config.h"
 #import <dlfcn.h>
@@ -71,8 +74,25 @@ static void PatrolTick(void) {
             case AuthResultOK:
                 return; /* 下一轮巡检继续 */
             case AuthResultNeedActivate:   /* 未激活/无效/过期/设备不匹配 */
-            case AuthResultSecurityError:  /* 响应验签失败，疑似伪造 */
-            case AuthResultNetworkError:   /* 断网同样视为未通过 */
+            case AuthResultSecurityError:  /* 响应验签失败,疑似伪造 */
+                /* 凭据失效:清凭据并弹激活面板,让用户当场重新激活
+                 * (而非直接闪退——直接 die 不清凭据会导致下次启动 hasLocalCredential
+                 * 仍为真、不弹面板,反复闪退直到凭据被某次清掉,体验差且像没卡密) */
+                NSLog(@"[guard] patrol reject (%ld), clear cred + show panel", (long)result);
+                [[AuthManager shared] clearCredential];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIWindow *win = nil;
+                    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+                        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+                        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                            if (w.isKeyWindow) { win = w; break; }
+                        }
+                        if (win) break;
+                    }
+                    if (win) [AuthUI showOnHostWindow:win];
+                });
+                return; /* 不 die:面板阻塞,等用户重新激活;激活成功后巡检自然恢复 */
+            case AuthResultNetworkError:   /* 断网:离线容忍由 hasUsableOfflineCache 兜底 */
             default:
                 NSLog(@"[guard] patrol reject (%ld)", (long)result);
                 guard_request_die();
