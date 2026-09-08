@@ -158,9 +158,10 @@ jobs:
           ! strings "$APP_DIR/Frameworks/$GUARD_NAME" | grep -qiE "agent\.js|FridaGadget|libguard" \
             && echo "[ok] no sensitive strings in guard" || true
 
-          # 6.3 若嵌入 JS（稳妥模式）：loader 壳与 Gadget 必须静态存在，
-          #     Gadget 必须 LC_LOAD 进主二进制，config 指向 loader
-          if [ -f agent.js ]; then
+          # 6.3 若嵌入了 JS(EMBED_AGENT_JS=true 时):loader 壳与 Gadget 必须静态存在,
+          #     Gadget 必须 LC_LOAD 进主二进制,config 指向 loader
+          #     EMBED_AGENT_JS=false 时无 Gadget,跳过本组检查
+          if [ -f "$APP_DIR/Frameworks/$GADGET_NAME" ]; then
             [ -f "$APP_DIR/Frameworks/$JS_DOC_NAME" ] \
               || { echo "::error::js loader missing ($JS_DOC_NAME)"; exit 1; }
             [ -f "$APP_DIR/Frameworks/$GADGET_NAME" ] \
