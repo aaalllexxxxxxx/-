@@ -28,12 +28,12 @@ echo "[*] js key injected -> $OUT_DIR/guard_js_key.inc"
 # 若存在 src/auth/*.mm（AuthDylib 卡密验证），与 guard.c + guard_bridge.mm
 # 合并编译为单一 dylib，并启用桥接模式（JS 加载由卡密状态控制）
 SRCS="src/guard.c"
-EXTRA_FLAGS=""
+EXTRA_FLAGS="-I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
 EXTRA_LDFLAGS=""
 if [ "$EMBED_AUTH_DYLIB" != "false" ] && ls src/auth/*.mm >/dev/null 2>&1; then
   echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
   SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
-  EXTRA_FLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc -I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
+  EXTRA_FLAGS="$EXTRA_FLAGS -fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc"
   EXTRA_LDFLAGS="-lc++ -framework UIKit -framework Security -framework CoreGraphics"
 fi
 
