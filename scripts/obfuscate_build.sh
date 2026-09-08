@@ -46,12 +46,12 @@ export OMVLL_CONFIG="$PWD/omvll_config.py"
 
 # 与 build_guard.sh 保持一致: 存在 AuthDylib 源码时合并编译为单一 dylib (bridge mode)
 SRCS="src/guard.c"
-EXTRA_CFLAGS=""
+EXTRA_CFLAGS="-I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
 EXTRA_LDFLAGS=""
 if [ "$EMBED_AUTH_DYLIB" != "false" ] && ls src/auth/*.mm >/dev/null 2>&1; then
   echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
   SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
-  EXTRA_CFLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc -I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc"
   EXTRA_LDFLAGS="-lc++ -framework UIKit -framework Security -framework CoreGraphics"
 fi
 
