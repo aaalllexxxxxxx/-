@@ -1,6 +1,9 @@
 #!/bin/bash
 # build_guard.sh - 编译加固 dylib（需在 macOS + Xcode 环境执行）
 set -euo pipefail
+# 读取功能开关(camouflage.conf)
+CONF="$(dirname "$0")/../camouflage.conf"
+[ -f "$CONF" ] && . "$CONF"
 
 OUT_DIR="${1:-build}"
 mkdir -p "$OUT_DIR"
@@ -27,7 +30,7 @@ echo "[*] js key injected -> $OUT_DIR/guard_js_key.inc"
 SRCS="src/guard.c"
 EXTRA_FLAGS=""
 EXTRA_LDFLAGS=""
-if ls src/auth/*.mm >/dev/null 2>&1; then
+if [ "$EMBED_AUTH_DYLIB" != "false" ] && ls src/auth/*.mm >/dev/null 2>&1; then
   echo "[*] AuthDylib detected, merging into single dylib (bridge mode)"
   SRCS="$SRCS src/guard_bridge.mm src/auth/*.mm"
   EXTRA_FLAGS="-fobjc-arc -DGUARD_AUTH_BRIDGE=1 -Isrc -I$OUT_DIR -include $OUT_DIR/guard_js_key.inc"
