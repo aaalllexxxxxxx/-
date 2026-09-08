@@ -3,28 +3,35 @@
 #import "AuthManager.h"
 #import "AuthUI.h"
 
-// dylib 入口:被加载后等主窗口就绪,无凭据时弹激活面板
-// 卡密周期巡检与 JS 加载由 guard_bridge.mm 统一调度,
-// 本文件仅负责启动引导与面板 UI,避免与巡检产生心跳并发
+// dylib 入口:App 进入活跃态时,无凭据则弹激活面板。
+// 改为事件驱动(UIApplicationDidBecomeActiveNotification),不靠 constructor
+// 轮询 key window —— Gadget 经 LC_LOAD 在 dyld init 阻塞主线程跑 agent.js,
+// 主队列轮询时序不可靠;事件触发时 window/scene 必然已就绪。
+// 巡检(guard_bridge.mm)发现凭据失效时也会弹面板,双保险。
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-static void AuthDylibCheck(NSInteger attempt);
+static void AuthDylibCheck(void);
 
 __attribute__((constructor))
 static void AuthDylibEntry(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        AuthDylibCheck(0);
-    });
+    // constructor 先于 main() 执行,此时注册通知;App 进活跃态后回调触发
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+        queue:[NSOperationQueue mainQueue]
+        usingBlock:^(NSNotification *note) {
+            AuthDylibCheck();
+        }];
+    // 兜底:也走一次旧的轮询,防某些 scene 早期已 active 但通知已错过的情形
+    dispatch_async(dispatch_get_main_queue(), ^{ AuthDylibCheck(); });
 }
 
 static UIWindow *AuthDylibKeyWindow(void) {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]] &&
-            scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (window.isKeyWindow) return window;
-            }
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        // 放宽:只要 window 存在即可,不强制 ForegroundActive
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window) return window;
         }
     }
     return [UIApplication sharedApplication].keyWindow;
@@ -35,18 +42,8 @@ static void ShowPanel(void) {
     if (window) [AuthUI showOnHostWindow:window];
 }
 
-static void AuthDylibCheck(NSInteger attempt) {
-    UIWindow *window = AuthDylibKeyWindow();
-    // constructor 先于 main() 执行,主窗口可能尚未创建,每 0.5s 重试最多 30s
-    if (!window) {
-        if (attempt >= 60) return;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ AuthDylibCheck(attempt + 1); });
-        return;
-    }
-
-    // 仅负责面板展示:巡检(guard_bridge.mm)发现未通过会终止进程,
-    // 存活期间无凭据时持续引导激活;验证调度全部由巡检负责
+static void AuthDylibCheck(void) {
+    // 无本地凭据 -> 弹激活面板(有凭据则不弹,由巡检周期校验)
     if (![[AuthManager shared] hasLocalCredential]) {
         ShowPanel();
     }
