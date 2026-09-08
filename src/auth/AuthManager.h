@@ -17,6 +17,9 @@ typedef NS_ENUM(NSInteger, AuthResult) {
 /// Keychain 中是否已有激活凭据(secret_key)
 - (BOOL)hasLocalCredential;
 
+/// 清除本地凭据(巡检发现失效时调用,以便下次启动重新激活)
+- (void)clearCredential;
+
 /// 激活卡密并绑定本机(POST /api/activate),回调回主线程
 - (void)activateCard:(NSString *)card
             callback:(void (^)(AuthResult result, NSString *msg, NSDictionary *info))callback;
